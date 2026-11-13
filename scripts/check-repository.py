@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def main():
     paths = subprocess.check_output(
-        ['git', '-C', str(ROOT), 'ls-files', '-z'], text=True
+        ['git', '-C', str(ROOT), 'ls-files', '-z'], text=True, encoding='utf-8'
     ).split('\0')
     paths = [p for p in paths if p]
     assert paths, 'No tracked source files'
@@ -38,13 +38,13 @@ def main():
         if name.startswith(('runtime/', 'scripts/', 'project-control/')) and p.suffix == '.py':
             ast.parse(p.read_text(encoding='utf-8'), filename=name)
             parsed += 1
-    example = json.loads((ROOT / 'runtime/config.example.json').read_text())
+    example = json.loads((ROOT / 'runtime/config.example.json').read_text(encoding='utf-8'))
     assert example['backend'] == 'cpp'
     for key in ('llamacpp_root', 'model_dir'):
         assert not Path(example['cpp_backend'][key]).is_absolute(), key
-    assert json.loads((ROOT / 'profiles/apple-m5.json').read_text()) == json.loads((ROOT / 'selected-profile.json').read_text())
+    assert json.loads((ROOT / 'profiles/apple-m5.json').read_text(encoding='utf-8')) == json.loads((ROOT / 'selected-profile.json').read_text(encoding='utf-8'))
     for name in ('README.md', 'README.zh-CN.md'):
-        body = (ROOT / name).read_text()
+        body = (ROOT / name).read_text(encoding='utf-8')
         assert body.splitlines()[0] == '# duplex.cpp'
         for target in re.findall(r'\]\(([^)]+)\)', body):
             if '://' not in target and not target.startswith('#'):
