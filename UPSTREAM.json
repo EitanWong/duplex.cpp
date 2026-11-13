@@ -1,0 +1,17 @@
+{
+  "engine": {
+    "repository": "https://github.com/OpenBMB/llama.cpp-omni",
+    "commit": "a64932ec615e1463158129feaf2f0752d0c07a2e",
+    "local_modifications": true,
+    "layout": "vendored working-tree source, without nested Git metadata"
+  },
+  "runtime": {
+    "repository": "https://github.com/OpenBMB/MiniCPM-o-Demo",
+    "branch": "Comni",
+    "reference_commit": "9af4308a93ca889ddf5c7c7bde1bcfbb6ff9b147",
+    "snapshot_commit_verified": false,
+    "local_modifications": true
+  },
+  "ai_assisted_integration": true,
+  "preserved_profile": "profiles/apple-m5.json"
+}

@@ -1,0 +1,32 @@
+{
+  "backend": "cpp",
+  "model": {
+    "model_path": "unused-for-cpp-backend"
+  },
+  "cpp_backend": {
+    "llamacpp_root": "../engine",
+    "model_dir": "../models/MiniCPM-o-4_5-gguf",
+    "llm_model": "MiniCPM-o-4_5-Q4_K_M.gguf",
+    "cpp_server_port": 19080,
+    "ctx_size": 8192,
+    "n_gpu_layers": 99
+  },
+  "audio": {
+    "ref_audio_path": "assets/ref_audio/ref_minicpm_signature.wav",
+    "playback_delay_ms": 100,
+    "chat_vocoder": "token2wav"
+  },
+  "service": {
+    "gateway_port": 8040,
+    "worker_base_port": 22440,
+    "num_workers": 1,
+    "max_queue_size": 1,
+    "request_timeout": 180
+  },
+  "recording": {
+    "enabled": false
+  },
+  "duplex": {
+    "pause_timeout": 120
+  }
+}
