@@ -22,6 +22,7 @@
 struct vision_ctx;
 struct audition_ctx;
 struct audition_audio_f32;
+struct tts_cuda_head;
 
 // Forward declaration for C++ Token2Wav
 namespace omni {
@@ -75,6 +76,8 @@ struct LLMThreadInfo {
     std::queue<omni_embeds*> queue;
     std::mutex mtx;
     std::condition_variable cv;
+    std::condition_variable decode_cv;
+    bool prefill_done = false; // protected by mtx, scoped to this context
     std::chrono::steady_clock::time_point start;
     std::chrono::steady_clock::time_point end;
 
@@ -182,6 +185,10 @@ struct omni_context {
     // true: omni_init 内部加载的模型，omni_free 时需要释放
     // false: 外部传入的已有模型（模型复用），omni_free 时不释放
     bool owns_model = true;
+
+    // Exact token prefix of the last plain-text input, in resident LLM KV.
+    // Generation tokens are never treated as a verified input prefix.
+    std::vector<llama_token> text_prompt_cache;
 
     // 🔧 [Length Penalty] 用于调整 EOS token 的采样概率
     // length_penalty > 1.0 会降低 EOS 概率，让模型生成更长的输出
@@ -409,6 +416,10 @@ struct omni_context {
     // head_code: Linear layer (hidden_size=768 -> num_audio_tokens=6562)
     // Note: num_vq=1, so we only need one head_code layer
     float * head_code_weight = nullptr;  // (768, 6562) - stored as (hidden_size, num_audio_tokens)
+    std::vector<float> head_code_cpu_packed; // optional exact-order AVX2 CPU projection
+    bool head_code_cpu_interleaved = false;
+    struct tts_cuda_head * head_code_cuda = nullptr;
+    bool head_code_cuda_attempted = false;
     int head_code_hidden_size = 0;  // 768
     int head_code_num_audio_tokens = 0;  // 6562
     
@@ -630,6 +641,10 @@ void omni_notify_audio_interrupt(struct omni_context * ctx_omni);
 bool stop_speek(struct omni_context * ctx_omni);
 
 bool clean_kvcache(struct omni_context * ctx_omni);
+
+// Synchronous text-only prefill with exact-prefix reuse. Caller stops inference
+// threads and clears this prefix before any multimodal or duplex input.
+bool omni_prefill_text_cached(struct omni_context * ctx_omni, const std::string & text, int & reused_tokens);
 
 // TTS 推理函数声明（用于 test_tts_inference.cpp）
 bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts_model_path);

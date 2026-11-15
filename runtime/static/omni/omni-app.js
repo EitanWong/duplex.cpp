@@ -36,7 +36,9 @@ import { initRefAudio } from '../duplex/ui/ref-audio-init.js';
 const SAMPLE_RATE_IN = 16000;
 const SAMPLE_RATE_OUT = 24000;
 const CHUNK_MS = 1000;
-const ENDPOINT_INPUT = new URLSearchParams(location.search).get('endpoint') !== '0';
+// Early endpoint padding can suppress replies after spoken interruptions.
+// Keep continuous native units by default; opt into the experiment explicitly.
+const ENDPOINT_INPUT = new URLSearchParams(location.search).get('endpoint') === '1';
 // 不在前端做 resize — 直接发摄像头/视频原始分辨率，后端统一处理（scale_resolution=448）
 
 let currentMode = 'live';

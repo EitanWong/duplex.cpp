@@ -19,7 +19,7 @@ The goal is fluid, high-quality conversation on a single consumer machine.
 | Target | Status |
 | --- | --- |
 | Apple Silicon / M5 | Existing Metal, CoreML/ANE and Accelerate optimizations preserved |
-| Windows / NVIDIA RTX 3060 12 GB | Next optimization target; performance and compatibility acceptance pending |
+| Windows / NVIDIA RTX 3060 12 GB | Native CUDA build, GPU operators and fixture replay verified; human speech quality acceptance pending |
 
 Long-session audio continuity and speech quality remain active work. See the
 [Apple baseline](docs/apple-silicon.md) and [NVIDIA development guide](docs/nvidia.md).
@@ -40,13 +40,35 @@ Prepare the [model files](docs/models.md), then configure and build:
 
 ```bash
 python scripts/configure.py --model-dir /absolute/path/to/MiniCPM-o-4_5-gguf
-./scripts/build-release.sh
-./project-control/start.sh
+./scripts/macos/build.sh
+./scripts/macos/start.sh
 ```
 
 Open **http://localhost:8040/omni** and enable the microphone. Headphones are
-recommended. Use `./project-control/status.sh` and `./project-control/stop.sh`
+recommended. Use `./scripts/macos/status.sh` and `./scripts/macos/stop.sh`
 to inspect or stop the service. Model weights are downloaded separately.
+
+## Quick start — Windows / RTX 3060
+
+With a Python environment, the [model files](docs/models.md), VS 2022 C++ tools,
+CUDA 12.8+, CMake and Ninja ready, use PowerShell:
+
+```powershell
+.venv/Scripts/python scripts/configure.py --profile nvidia-rtx3060
+./scripts/windows/build.ps1 -CudaRoot $env:CUDA_PATH
+./scripts/windows/start.ps1
+```
+
+Open the address printed by the launcher (default **http://localhost:8040/omni**).
+Use `./scripts/windows/status.ps1` to check readiness and `./scripts/windows/stop.ps1`
+to stop all service processes. Double-clickable `.bat` entries are in the same folder.
+The profile uses one worker, a 4096-token
+context, CUDA Flash Attention and an AVX2 acoustic head. See the
+[NVIDIA guide](docs/nvidia.md) for setup, measured results and limits.
+The [optimization report](docs/inference-optimization.md) covers pipeline
+bottlenecks, VRAM reductions, CUDA kernels and quantization/pruning priorities;
+[voice-path measurements](docs/voice-optimization-rtx3060.md) cover lazy vision and AVX2 tuning.
+For other devices on your LAN, follow the [HTTPS setup](docs/nvidia.md#private-lan-access--局域网访问).
 
 ## API
 
@@ -69,7 +91,10 @@ changes with a `dev` → `main` PR and **Squash and merge**. Keep experimental
 branches local. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 `engine/` contains the native engine, `runtime/` the service and client,
-and `profiles/apple-m5.json` the preserved hardware profile.
+and `profiles/` the hardware profiles, including the preserved Apple M5 profile.
+Platform entry points are grouped under `scripts/windows/` and `scripts/macos/`.
+See the [script index](scripts/README.md), [project layout](docs/project-layout.md)
+and [documentation index](docs/README.md).
 
 ## Credits and licensing
 

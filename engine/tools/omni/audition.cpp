@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -226,6 +227,7 @@ struct audition_ctx {
     // Whisper KV cache for streaming
     struct whisper_kv_cache whisper_kv_cache;
     bool whisper_streaming_mode = true;
+    bool flash_attn = false;
 
     // for debugging
     bool debug_graph = false;
@@ -258,6 +260,10 @@ struct audition_ctx {
             backend = backend_cpu;
             LOG_INF("%s: CLIP using CPU backend\n", __func__);
         }
+
+        const char * flash = std::getenv("OMNI_AUDIO_FLASH_ATTN");
+        flash_attn = flash && std::strcmp(flash, "1") == 0 &&
+                     std::strncmp(ggml_backend_name(backend), "CUDA", 4) == 0;
 
         backend_ptrs.push_back(backend_cpu);
         backend_buft.push_back(ggml_backend_get_default_buffer_type(backend_cpu));
@@ -628,12 +634,25 @@ struct audition_graph {
                 }
                 
                 // Step 3: Attention computation
-                ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q);
-                ggml_tensor * KQ_soft_max = ggml_soft_max_ext(ctx0, KQ, nullptr, KQscale, 0.0f);
-                
-                ggml_tensor * KQV = ggml_mul_mat(ctx0, V, KQ_soft_max);
-                ggml_tensor * KQV_merged = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
-                cur = ggml_cont_2d(ctx0, KQV_merged, n_state, n_tokens);
+                ggml_tensor * attn = nullptr;
+                if (ctx->flash_attn) {
+                    // V is [history, head_dim, heads]; Flash Attention expects
+                    // [head_dim, history, heads]. Cached K/V remain F16 and
+                    // keep the same history, positions and non-causal mask.
+                    auto * v_flash = ggml_cont(ctx0, ggml_transpose(ctx0, V));
+                    auto * candidate = ggml_flash_attn_ext(ctx0, Q, K, v_flash, nullptr, KQscale, 0.0f, 0.0f);
+                    ggml_flash_attn_ext_set_prec(candidate, GGML_PREC_F32);
+                    if (ggml_backend_supports_op(ctx->backend, candidate)) attn = candidate;
+                }
+                if (attn) {
+                    cur = ggml_reshape_2d(ctx0, attn, n_state, n_tokens);
+                } else {
+                    ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q);
+                    ggml_tensor * KQ_soft_max = ggml_soft_max_ext(ctx0, KQ, nullptr, KQscale, 0.0f);
+                    ggml_tensor * KQV = ggml_mul_mat(ctx0, V, KQ_soft_max);
+                    ggml_tensor * KQV_merged = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
+                    cur = ggml_cont_2d(ctx0, KQV_merged, n_state, n_tokens);
+                }
             }
             
             // Attention output projection
@@ -1191,12 +1210,42 @@ struct audition_model_loader {
         audition_audio_f32_ptr audio(audition_audio_f32_init());
 
         audio->nx = hparams.warmup_audio_size;
+        const char * reserve_frames = std::getenv("OMNI_AUDIO_RESERVE_FRAMES");
+        if (reserve_frames && std::strncmp(ggml_backend_name(ctx_audition.backend), "CUDA", 4) == 0) {
+            char * end = nullptr;
+            errno = 0;
+            const long frames = std::strtol(reserve_frames, &end, 10);
+            if (!errno && end != reserve_frames && *end == '\0' &&
+                frames >= 10 && frames <= hparams.warmup_audio_size && frames % 2 == 0) {
+                audio->nx = static_cast<int>(frames);
+            } else {
+                LOG_WRN("Invalid OMNI_AUDIO_RESERVE_FRAMES=%s; using %d\n", reserve_frames, audio->nx);
+            }
+        }
         audio->ny = hparams.n_mel_bins;
 
+        const int query_frames = audio->nx;
         batch.entries.push_back(std::move(audio));
 
-        ggml_cgraph * gf = audition_audio_build_graph(&ctx_audition, batch);
-        ggml_backend_sched_reserve(ctx_audition.sched.get(), gf);
+        // Reserve a short query against the maximum cached history. Reserving
+        // 1500 queries unnecessarily retains a quadratic attention workspace
+        // throughout a duplex session. Longer real inputs still grow gallocr.
+        auto & cache = ctx_audition.whisper_kv_cache;
+        const int saved_iter = cache.iter;
+        if (cache.buffer && cache.size % (query_frames / 2) == 0) {
+            cache.iter = cache.size / (query_frames / 2) - 1;
+        }
+        ggml_cgraph * gf = nullptr;
+        try {
+            gf = audition_audio_build_graph(&ctx_audition, batch);
+        } catch (...) {
+            cache.iter = saved_iter;
+            throw;
+        }
+        cache.iter = saved_iter;
+        if (!ggml_backend_sched_reserve(ctx_audition.sched.get(), gf)) {
+            throw std::runtime_error("failed to reserve audio compute buffer");
+        }
 
         for (size_t i = 0; i < ctx_audition.backend_ptrs.size(); ++i) {
             ggml_backend_t backend = ctx_audition.backend_ptrs[i];

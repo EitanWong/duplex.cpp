@@ -8,7 +8,7 @@ import json
 import time
 import urllib.request
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 FIELDS = ['ri_user_time','ri_system_time','ri_pkg_idle_wkups','ri_interrupt_wkups','ri_pageins','ri_wired_size','ri_resident_size','ri_phys_footprint','ri_proc_start_abstime','ri_proc_exit_abstime','ri_child_user_time','ri_child_system_time','ri_child_pkg_idle_wkups','ri_child_interrupt_wkups','ri_child_pageins','ri_child_elapsed_abstime','ri_diskio_bytesread','ri_diskio_byteswritten']
 class Usage(ctypes.Structure):
     _fields_ = [('uuid', ctypes.c_uint8*16)]+[(name, ctypes.c_uint64) for name in FIELDS]
@@ -31,7 +31,7 @@ def main():
         while True:
             row = {'at':datetime.now(timezone.utc).isoformat(), 'epoch':time.time(), 'processes':{}, 'health':{}}
             try:
-                state = json.loads((ROOT/'service-state.json').read_text())
+                state = json.loads((ROOT/'.local/state/macos.json').read_text())
                 for name, entry in state.items():
                     usage = Usage()
                     status = lib.proc_pid_rusage(entry['pid'], 2, ctypes.byref(usage))

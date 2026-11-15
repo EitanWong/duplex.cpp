@@ -6738,7 +6738,8 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
                                                 std::vector<float> &       out_wave_bt,
                                                 int64_t &                  out_T_audio,
                                                 std::vector<float> &       out_source_bt1,
-                                                int64_t &                  out_T_source) const {
+                                                int64_t &                  out_T_source,
+                                                const device_mel_input *   device_mel) const {
     if (!model || !model->hg2 || !model->backend || !model->galloc) {
         return false;
     }
@@ -6747,7 +6748,7 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
     if (T_mel <= 0) {
         return false;
     }
-    if (speech_feat_bct.size() != (size_t) (B * C * T_mel)) {
+    if (!device_mel && speech_feat_bct.size() != (size_t) (B * C * T_mel)) {
         LOG_ERROR( "voc_hg2_runner_eval_stream: invalid speech_feat_bct size\n");
         return false;
     }
@@ -6777,8 +6778,28 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
         return false;
     }
     std::unique_ptr<ggml_context, decltype(&ggml_free)> owned_ctx(ctx, &ggml_free);
-    ggml_tensor * speech_upload_tcb   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, T_mel, C, B);
-    ggml_tensor * speech_feat_c80_t_b = ggml_cont(ctx, ggml_permute(ctx, speech_upload_tcb, 1, 0, 2, 3));
+    ggml_tensor * speech_upload_tcb = nullptr;
+    ggml_tensor * speech_feat_c80_t_b = nullptr;
+    if (device_mel) {
+        if (!device_mel->mel_ctb || !device_mel->cache_ctb ||
+            device_mel->mel_ctb->type != GGML_TYPE_F32 ||
+            device_mel->mel_ctb->ne[0] != C || device_mel->mel_ctb->ne[2] != B ||
+            !ggml_is_contiguous(device_mel->mel_ctb) ||
+            device_mel->cache_ctb->type != GGML_TYPE_F32 || device_mel->cache_ctb->ne[0] != C ||
+            device_mel->cache_ctb->ne[2] != B || !ggml_is_contiguous(device_mel->cache_ctb) ||
+            device_mel->frames <= 0 || device_mel->frames > device_mel->mel_ctb->ne[1] ||
+            device_mel->cache_frames < 0 || device_mel->cache_frames > device_mel->cache_ctb->ne[1] ||
+            T_mel != device_mel->frames + device_mel->cache_frames) return false;
+        // Own a vocoder input buffer. Copying only values avoids traversing the
+        // flow tensor's graph and prevents its allocator/lifetime from escaping.
+        speech_feat_c80_t_b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, T_mel, B);
+        // Its tail is read after vocoder execution to seed the next window.
+        // Prevent gallocr from recycling this input during the graph.
+        ggml_set_output(speech_feat_c80_t_b);
+    } else {
+        speech_upload_tcb = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, T_mel, C, B);
+        speech_feat_c80_t_b = ggml_cont(ctx, ggml_permute(ctx, speech_upload_tcb, 1, 0, 2, 3));
+    }
     ggml_tensor * cache_source_t1_b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, Tc, 1, B);
     ggml_tensor * wave_t_b    = nullptr;
     ggml_tensor * source_t1_b = nullptr;
@@ -6816,12 +6837,33 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
             return false;
         }
     }
+    const auto copy_mel = [&](ggml_tensor * src, int64_t src_offset,
+                              ggml_tensor * dst, int64_t dst_offset, int64_t frames) {
+        const size_t stride = C * sizeof(float);
+        auto * src_view = ggml_view_3d(ctx, src, C, frames, B, stride, stride * frames, stride * src_offset);
+        auto * dst_view = ggml_view_3d(ctx, dst, C, frames, B, stride, stride * frames, stride * dst_offset);
+        // These views are created after graph allocation, so initialize their
+        // backend buffers explicitly before copying between the CUDA contexts.
+        if (ggml_backend_view_init(src_view) != GGML_STATUS_SUCCESS ||
+            ggml_backend_view_init(dst_view) != GGML_STATUS_SUCCESS) return false;
+        ggml_backend_tensor_copy(src_view, dst_view);
+        return true;
+    };
     {
         omni::flow::profile::ScopeTimer _t("voc.upload");
         model->hg2->gen.dsp.hg_stft16_params_upload_consts(model->backend);
         model->hg2->gen.source_nsf.sine_gen.hg_sine_gen2_upload_consts(model->backend);
-        hg_backend_tensor_set(model->backend, speech_upload_tcb, speech_feat_bct.data(),
-                                                 speech_feat_bct.size() * sizeof(float));
+        if (device_mel) {
+            if (device_mel->cache_frames > 0) {
+                if (!copy_mel(device_mel->cache_ctb, 0, speech_feat_c80_t_b, 0,
+                              device_mel->cache_frames)) return false;
+            }
+            if (!copy_mel(device_mel->mel_ctb, 0, speech_feat_c80_t_b, device_mel->cache_frames,
+                          device_mel->frames)) return false;
+        } else {
+            hg_backend_tensor_set(model->backend, speech_upload_tcb, speech_feat_bct.data(),
+                                  speech_feat_bct.size() * sizeof(float));
+        }
         if (Tc > 0) {
             hg_backend_tensor_set(model->backend, cache_source_t1_b, cache_source_bt1.data(),
                                                      cache_source_bt1.size() * sizeof(float));
@@ -6844,6 +6886,10 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
             LOG_ERROR( "voc_hg2_runner_eval_stream: ggml_backend_graph_compute failed\n");
             return false;
         }
+    }
+    if (device_mel) {
+        const int64_t keep = std::min(T_mel, device_mel->cache_ctb->ne[1]);
+        if (!copy_mel(speech_feat_c80_t_b, T_mel - keep, device_mel->cache_ctb, 0, keep)) return false;
     }
     omni::flow::profile::ScopeTimer _download_timer("voc.download");
     std::vector<float> wave_tb;
@@ -7935,8 +7981,10 @@ bool flowGGUFModelRunner::inference_chunk(const int32_t *             token_bt,
                                           int                         n_timesteps,
                                           float                       temperature,
                                           std::vector<float> &        mel_bct_out,
-                                          flowStreamCacheHost &       cache_out) {
+                                          flowStreamCacheHost &       cache_out,
+                                          ggml_tensor **              device_output) {
     mel_bct_out.clear();
+    if (device_output) *device_output = nullptr;
     cache_out.clear();
     if (!token_bt || !spk_bc || B <= 0 || T_token <= 0) {
         return false;
@@ -8039,7 +8087,9 @@ bool flowGGUFModelRunner::inference_chunk(const int32_t *             token_bt,
             ggml_backend_synchronize(loader_.backend());
         }
     }
-    {
+    if (device_output) {
+        *device_output = feat;
+    } else {
         omni::flow::profile::ScopeTimer _t("t2m.download");
         const int64_t      Bb = feat->ne[2];
         std::vector<float> feat_ctb((size_t) C * (size_t) T * (size_t) Bb);
@@ -9069,7 +9119,8 @@ bool Token2Mel::ensure_ready_for_infer() const {
     return true;
 }
 
-bool Token2Mel::infer_one_chunk(const std::vector<int32_t> & chunk_bt, bool last_chunk, std::vector<float> & mel_bct) {
+bool Token2Mel::infer_one_chunk(const std::vector<int32_t> & chunk_bt, bool last_chunk, std::vector<float> & mel_bct,
+                              ggml_tensor ** device_output) {
     // 用于推理一个固定窗口(dt=28)并更新内部cache
     mel_bct.clear();
     if (!ensure_ready_for_infer()) {
@@ -9083,7 +9134,7 @@ bool Token2Mel::infer_one_chunk(const std::vector<int32_t> & chunk_bt, bool last
 
     flowStreamCacheHost cache_out;
     if (!runner_.inference_chunk(chunk_bt.data(), 1, kDt, spk_bc_.data(), kSpkDim, last_chunk, cache_in_, n_timesteps_,
-                                 temperature_, mel_bct, cache_out)) {
+                                 temperature_, mel_bct, cache_out, device_output)) {
         LOG_ERROR( "Token2Mel.infer_one_chunk: runner.inference_chunk failed\n");
         return false;
     }
@@ -9472,9 +9523,11 @@ void Token2Mel::append_bct_along_time(const std::vector<float> & src_bct,
     dst_bct_inout.swap(next);
 }
 
-bool Token2Mel::push_tokens(const int32_t * tokens, int64_t n_tokens, bool is_final, std::vector<float> & mel_bct_out) {
+bool Token2Mel::push_tokens(const int32_t * tokens, int64_t n_tokens, bool is_final, std::vector<float> & mel_bct_out,
+                           ggml_tensor ** device_output) {
     // 用于将tokens补齐并推理一次(必要时按n_tokens裁剪输出T)
     mel_bct_out.clear();
+    if (device_output) *device_output = nullptr;
     if (!ensure_ready_for_infer()) {
         return false;
     }
@@ -9496,10 +9549,13 @@ bool Token2Mel::push_tokens(const int32_t * tokens, int64_t n_tokens, bool is_fi
     std::vector<float> mel_chunk_bct;
     const bool ok = (backend_kind_ == Backend::ANE)
                         ? infer_one_chunk_ane_(chunk_bt, is_final, mel_chunk_bct)
-                        : infer_one_chunk(chunk_bt, is_final, mel_chunk_bct);
+                        : infer_one_chunk(chunk_bt, is_final, mel_chunk_bct, device_output);
     if (!ok) {
         return false;
     }
+    // Device consumers crop the contiguous CTB prefix to min(T, 2*n_tokens)
+    // before the next flow call. ANE continues through the original host path.
+    if (device_output && *device_output) return true;
 
     if (n_tokens > 0) {
         const int64_t B           = 1;
@@ -9714,6 +9770,20 @@ void fade_in_out_b1(std::vector<float> &       wave_inout,
 
 }  // namespace token2wav_utils
 
+Token2Wav::~Token2Wav() {
+    free_device_mel();
+}
+
+void Token2Wav::free_device_mel() {
+    if (device_mel_buf_) ggml_backend_buffer_free(device_mel_buf_);
+    if (device_mel_ctx_) ggml_free(device_mel_ctx_);
+    device_mel_buf_ = nullptr;
+    device_mel_ctx_ = nullptr;
+    device_mel_cache_ = nullptr;
+    device_mel_cache_frames_ = 0;
+    device_mel_enabled_ = false;
+}
+
 bool Token2Wav::load_models(const std::string & encoder_gguf,
                             const std::string & flow_matching_gguf,
                             const std::string & flow_extra_gguf,
@@ -9722,6 +9792,7 @@ bool Token2Wav::load_models(const std::string & encoder_gguf,
                             const std::string & device_vocoder,
                             const std::string & coreml_model_path) {
     reset_stream();
+    free_device_mel();
 
     // Bound CPU workers independently from the LLM for heterogeneous Apple CPUs.
     int kDefaultThreads = 8;
@@ -9745,6 +9816,25 @@ bool Token2Wav::load_models(const std::string & encoder_gguf,
     }
 
     voc_runner_.model = &voc_model_;
+    const char * device_mel = std::getenv("OMNI_T2W_DEVICE_MEL");
+    auto flow_backend = t2m_.device_backend();
+    if (device_mel && std::strcmp(device_mel, "1") == 0 && flow_backend &&
+        std::strncmp(ggml_backend_name(flow_backend), "CUDA", 4) == 0 &&
+        std::strncmp(ggml_backend_name(voc_model_.backend), "CUDA", 4) == 0 &&
+        ggml_backend_get_device(flow_backend) == ggml_backend_get_device(voc_model_.backend)) {
+        ggml_init_params params{};
+        params.mem_size = 2 * ggml_tensor_overhead();
+        params.no_alloc = true;
+        device_mel_ctx_ = ggml_init(params);
+        if (device_mel_ctx_) {
+            device_mel_cache_ = ggml_new_tensor_3d(device_mel_ctx_, GGML_TYPE_F32,
+                                                  Token2Mel::kMelChannels, kMelCacheLen, 1);
+            device_mel_buf_ = ggml_backend_alloc_ctx_tensors(device_mel_ctx_, voc_model_.backend);
+        }
+        if (device_mel_buf_) device_mel_enabled_ = true;
+        else free_device_mel();
+    }
+    std::fprintf(stderr, "T2W device mel handoff %s\n", device_mel_enabled_ ? "enabled" : "disabled");
     const char * warmup = std::getenv("OMNI_VOC_WARMUP");
     if (voc_model_.blas_backend && warmup && std::strcmp(warmup, "1") == 0) {
         // Match the first 25-token window (two mel frames per token).
@@ -9766,6 +9856,7 @@ bool Token2Wav::load_models(const std::string & encoder_gguf,
 bool Token2Wav::start_stream_with_prompt_cache_gguf(const std::string & prompt_cache_gguf_path,
                                                     int                 n_timesteps,
                                                     float               temperature) {
+    device_mel_cache_frames_ = 0;
     voc_mel_cache_bct_.clear();
     voc_cache_source_bt1_.clear();
     voc_Tc_ = 0;
@@ -9786,6 +9877,7 @@ bool Token2Wav::start_stream_with_prompt_cache_gguf(const std::string & prompt_c
 }
 
 bool Token2Wav::start_stream_with_prompt(const Token2Mel::PromptBundle & prompt, int n_timesteps, float temperature) {
+    device_mel_cache_frames_ = 0;
     voc_mel_cache_bct_.clear();
     voc_cache_source_bt1_.clear();
     voc_Tc_ = 0;
@@ -9830,15 +9922,16 @@ bool Token2Wav::push_tokens_window(const int32_t *      tokens,
     const bool                  is_first = (cid == 0);
 
     std::vector<float> mel_bct;
+    ggml_tensor * device_output = nullptr;
     const auto         t_t2m0 = clock::now();
-    if (!t2m_.push_tokens(tokens, n_tokens, is_final, mel_bct)) {
+    if (!t2m_.push_tokens(tokens, n_tokens, is_final, mel_bct, device_mel_enabled_ ? &device_output : nullptr)) {
         LOG_ERROR("Token2Wav.push_tokens_window: Token2Mel.push_tokens failed\n");
         return false;
     }
     const auto   t_t2m1  = clock::now();
     const double t2m_ms  = std::chrono::duration<double, std::milli>(t_t2m1 - t_t2m0).count();
 
-    if (mel_bct.empty()) {
+    if (mel_bct.empty() && !device_output) {
         const double total_ms = std::chrono::duration<double, std::milli>(clock::now() - t_total0).count();
         omni::flow::profile::record_ms("token2mel", t2m_ms, is_first);
         omni::flow::profile::record_ms("vocoder", 0.0, is_first);
@@ -9859,13 +9952,22 @@ bool Token2Wav::push_tokens_window(const int32_t *      tokens,
     std::vector<float> mel_in_bct = voc_mel_cache_bct_;
     Token2Mel::append_bct_along_time(mel_bct, 1, Token2Mel::kMelChannels, mel_in_bct);
 
-    const int64_t T_mel = (int64_t) mel_in_bct.size() / (int64_t) Token2Mel::kMelChannels;
+    omni::vocoder::device_mel_input device_input;
+    if (device_output) {
+        device_input.mel_ctb = device_output;
+        device_input.cache_ctb = device_mel_cache_;
+        device_input.frames = std::min(device_output->ne[1], n_tokens * 2);
+        device_input.cache_frames = device_mel_cache_frames_;
+    }
+    const int64_t T_mel = device_output ? device_input.frames + device_input.cache_frames
+                                      : (int64_t) mel_in_bct.size() / Token2Mel::kMelChannels;
 
     std::vector<float> out_source_bt1;
     int64_t            out_T_source = 0;
     const auto t_voc0 = clock::now();
     if (!voc_runner_.voc_hg2_runner_eval_stream(mel_in_bct, T_mel, voc_cache_source_bt1_, voc_Tc_, wave_bt_out,
-                                                out_T_audio, out_source_bt1, out_T_source)) {
+                                                out_T_audio, out_source_bt1, out_T_source,
+                                                device_output ? &device_input : nullptr)) {
         LOG_ERROR( "Token2Wav.push_tokens_window: voc_hg2_runner_eval_stream failed\n");
         return false;
     }
@@ -9875,7 +9977,9 @@ bool Token2Wav::push_tokens_window(const int32_t *      tokens,
         token2wav_utils::fade_in_out_b1(wave_bt_out, voc_speech_cache_bt_, voc_speech_window_, (int64_t) kSourceCacheLen);
     }
 
-    {
+    if (device_output) {
+        device_mel_cache_frames_ = std::min(T_mel, (int64_t) kMelCacheLen);
+    } else {
         const int64_t      C       = Token2Mel::kMelChannels;
         const int64_t      T_total = (int64_t) mel_in_bct.size() / C;
         std::vector<float> next_mel_cache;
@@ -9921,6 +10025,7 @@ bool Token2Wav::push_tokens_window(const int32_t *      tokens,
 }
 
 void Token2Wav::reset_stream() {
+    device_mel_cache_frames_ = 0;
     t2m_.reset_stream();
     voc_mel_cache_bct_.clear();
     voc_cache_source_bt1_.clear();

@@ -1,15 +1,15 @@
 #!/bin/bash
 # Rebuild the production package entirely from the formal engine sources.
 set -euo pipefail
-ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
 DEST="$ROOT/releases/m5-integrated-v3/native"
 mkdir -p "$ROOT/releases"
-if [[ -f "$ROOT/service-state.json" ]] && "$ROOT/.venv/bin/python" - "$ROOT/service-state.json" <<'PY'
+if [[ -f "$ROOT/.local/state/macos.json" ]] && "$ROOT/.venv/bin/python" - "$ROOT/.local/state/macos.json" <<'PY'
 import json, sys
 raise SystemExit(0 if json.load(open(sys.argv[1])) else 1)
 PY
 then
-    echo "Stop the project with project-control/stop.sh before rebuilding its native release." >&2
+    echo "Stop the project with scripts/macos/stop.sh before rebuilding its native release." >&2
     exit 1
 fi
 cmake -S "$ROOT/engine" -B "$ROOT/engine/build" -G Ninja \

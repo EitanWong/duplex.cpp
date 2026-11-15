@@ -12,11 +12,11 @@ import sys
 import time
 import urllib.request
 
-ROOT = Path(__file__).resolve().parents[1]
-STATE = ROOT / 'service-state.json'
+ROOT = Path(__file__).resolve().parents[2]
+STATE = ROOT / '.local/state/macos.json'
 PYTHON = ROOT / '.venv/bin/python'
 
-STOP = ROOT / 'service-stop.request'
+STOP = STATE.parent / 'macos-stop.request'
 
 def fingerprint(pid):
     q = subprocess.run(['/bin/ps', '-p', str(pid), '-o', 'lstart=', '-o', 'args='], capture_output=True, text=True)
@@ -37,7 +37,7 @@ def owned(entry):
     return bool(command) and Path(command[0]).name in current and all(str(x) in current for x in command[1:])
 
 def save_state(state):
-    with tempfile.NamedTemporaryFile('w', dir=ROOT, prefix='.service-state-', delete=False) as f:
+    with tempfile.NamedTemporaryFile('w', dir=STATE.parent, prefix='.macos-', delete=False) as f:
         json.dump(state, f, indent=2); f.write('\n'); name = f.name
     os.replace(name, STATE)
 
@@ -75,7 +75,7 @@ def register_native(state):
 
 def supervise():
     # One monitor per workspace; an intentional stop marker prevents resurrection.
-    with (ROOT/'service-supervisor.lock').open('a') as lock:
+    with (STATE.parent/'macos-supervisor.lock').open('a') as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -84,14 +84,14 @@ def supervise():
         backoff = 5
         while not STOP.exists():
             try:
-                with (ROOT/'service-control.lock').open('a') as control:
+                with (STATE.parent/'macos-control.lock').open('a') as control:
                     fcntl.flock(control, fcntl.LOCK_EX)
                     state = json.loads(STATE.read_text()) if STATE.exists() else {}
                     state = register_native(state)
                 missing = [n for n in ('worker', 'gateway') if n not in state or not owned(state[n])]
                 if missing:
                     print('Recovering stopped processes:', ', '.join(missing), flush=True)
-                    q = subprocess.run([str(PYTHON), str(ROOT/'scripts/service.py'), 'repair'], cwd=ROOT, timeout=60)
+                    q = subprocess.run([str(PYTHON), str(ROOT/'scripts/macos/service.py'), 'repair'], cwd=ROOT, timeout=60)
                     backoff = min(60, backoff * 2) if q.returncode else 5
                     failures = 0
                 elif time.time()-state['worker'].get('started_at', time.time()) >= 120:
@@ -103,7 +103,7 @@ def supervise():
                         failures = 0  # A slow HTTP response alone is not evidence of a dead model.
                     if failures >= 3:
                         print('Native backend failed three health checks; recovering worker; active context is lost.', flush=True)
-                        with (ROOT/'service-control.lock').open('a') as control:
+                        with (STATE.parent/'macos-control.lock').open('a') as control:
                             fcntl.flock(control, fcntl.LOCK_EX)
                             latest = json.loads(STATE.read_text())
                             if not STOP.exists() and latest.get('worker') == state['worker']:
@@ -120,10 +120,21 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('action', choices=['start', 'stop', 'status', 'gateway', 'supervise', 'repair'])
     args = parser.parse_args()
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    (ROOT/'logs').mkdir(exist_ok=True)
+    for source, destination in {
+        'service-state.json': 'macos.json',
+        'service-stop.request': 'macos-stop.request',
+        'service-supervisor.lock': 'macos-supervisor.lock',
+        'service-control.lock': 'macos-control.lock',
+    }.items():
+        legacy, target = ROOT/source, STATE.parent/destination
+        if legacy.exists() and not target.exists():
+            legacy.rename(target)
     if args.action == 'supervise':
         supervise()
         return
-    control = (ROOT/'service-control.lock').open('a')
+    control = (STATE.parent/'macos-control.lock').open('a')
     fcntl.flock(control, fcntl.LOCK_EX)
     state = json.loads(STATE.read_text()) if STATE.exists() else {}
     state = register_native(state)
@@ -221,7 +232,7 @@ def main():
         save_state(state)
         print(f'Started {name} ({p.pid})')
     if args.action == 'start' and ('supervisor' not in state or not owned(state['supervisor'])):
-        command = [str(PYTHON), str(ROOT/'scripts/service.py'), 'supervise']
+        command = [str(PYTHON), str(ROOT/'scripts/macos/service.py'), 'supervise']
         with (ROOT/'logs/supervisor.log').open('ab') as output:
             p = subprocess.Popen(command, cwd=ROOT, stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
         state['supervisor'] = entry_for(p, command)

@@ -28,6 +28,7 @@
 #include <array>
 #include <numeric>
 #include <functional>
+#include <thread>
 
 
 struct omni_logger_state g_logger_state = {GGML_LOG_LEVEL_CONT, omni_log_callback_default, NULL};
@@ -212,6 +213,8 @@ struct vision_ctx {
     // 并非通用场景，因此需要显式开启。
     bool batch_encode = false;
 
+    bool flash_attn = false;
+
     // CoreML / ANE model path
     std::string coreml_model_path;
 
@@ -249,6 +252,14 @@ struct vision_ctx {
             backend = backend_cpu;
             LOG_INF("%s: vision using CPU backend\n", __func__);
         }
+
+#ifdef GGML_USE_CUDA
+        // Opt in per deployment: leave the validated Metal/CPU paths intact.
+        const char * flash = std::getenv("OMNI_VISION_FLASH_ATTN");
+        flash_attn = flash && std::strcmp(flash, "1") == 0 &&
+                     std::strncmp(ggml_backend_name(backend), "CUDA", 4) == 0;
+#endif
+        LOG_INF("%s: vision CUDA flash attention %s\n", __func__, flash_attn ? "enabled" : "disabled");
 
         backend_ptrs.push_back(backend_cpu);
         backend_buft.push_back(ggml_backend_get_default_buffer_type(backend_cpu));
@@ -1021,14 +1032,37 @@ private:
         ggml_tensor * k = ggml_permute(ctx0, k_cur, 0, 2, 1, 3);
         //cb(k, "k", il);
 
-        ggml_tensor * v = ggml_permute(ctx0, v_cur, 1, 2, 0, 3);
-        v = ggml_cont(ctx0, v);
-        //cb(k, "v", il);
-
-        ggml_tensor * cur;
-
-        // TODO @ngxson : support flash attention
-        {
+        ggml_tensor * cur = nullptr;
+        if (ctx->flash_attn) {
+            ggml_tensor * q_flash = q;
+            ggml_tensor * k_flash = k;
+            ggml_tensor * v_flash = ggml_permute(ctx0, v_cur, 0, 2, 1, 3);
+            // SigLIP uses 72-wide heads. Padding with zeros allows the CUDA
+            // tensor-core kernel (80-wide) while retaining the original scale.
+            const int64_t head_dim = q->ne[0];
+            if (head_dim == 72) {
+                q_flash = ggml_pad(ctx0, q_flash, 8, 0, 0, 0);
+                k_flash = ggml_pad(ctx0, k_flash, 8, 0, 0, 0);
+                v_flash = ggml_pad(ctx0, v_flash, 8, 0, 0, 0);
+            }
+            ggml_tensor * k_f16 = ggml_cast(ctx0, k_flash, GGML_TYPE_F16);
+            ggml_tensor * v_f16 = ggml_cast(ctx0, v_flash, GGML_TYPE_F16);
+            ggml_tensor * mask = kq_mask ? ggml_cast(ctx0, ggml_cont(ctx0, kq_mask), GGML_TYPE_F16) : nullptr;
+            ggml_tensor * attn = ggml_flash_attn_ext(ctx0, q_flash, k_f16, v_f16, mask, kq_scale, 0.0f, 0.0f);
+            ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
+            if (ggml_backend_supports_op(ctx->backend, attn)) {
+                if (attn->ne[0] != head_dim) {
+                    attn = ggml_cont(ctx0, ggml_view_4d(ctx0, attn, head_dim, attn->ne[1], attn->ne[2], attn->ne[3],
+                                                     attn->nb[1], attn->nb[2], attn->nb[3], 0));
+                }
+                cur = ggml_reshape_3d(ctx0, attn, attn->ne[0] * attn->ne[1], attn->ne[2], attn->ne[3]);
+                if (cur->ne[2] == 1) {
+                    cur = ggml_reshape_2d(ctx0, cur, cur->ne[0], cur->ne[1]);
+                }
+            }
+        }
+        if (!cur) {
+            ggml_tensor * v = ggml_cont(ctx0, ggml_permute(ctx0, v_cur, 1, 2, 0, 3));
             const auto n_tokens = q->ne[1];
             const auto n_head   = q->ne[2];
             const auto n_batch  = q->ne[3];
@@ -1727,6 +1761,65 @@ struct image_manipulation {
         }
     }
 
+    static bool bicubic_resize_fast(const vision_image_u8 & img, vision_image_u8 & dst,
+                                    int target_width, int target_height) {
+        const float tx = float(img.nx) / float(target_width);
+        const float ty = float(img.ny) / float(target_height);
+        struct column { int indices[4]; float dx; };
+        std::vector<column> columns(target_width);
+        for (int j = 0; j < target_width; ++j) {
+            const int x = int(tx * j);
+            columns[j].dx = tx * j - x;
+            for (int t = 0; t < 4; ++t) columns[j].indices[t] = clip(x - 1 + t, 0, img.nx - 1) * 3;
+        }
+        const auto rows = [&](int begin, int end) {
+            for (int i = begin; i < end; ++i) {
+                const int y = int(ty * i);
+                const float dy = ty * i - y;
+                const uint8_t * source[4];
+                for (int t = 0; t < 4; ++t) source[t] = img.buf.data() + clip(y - 1 + t, 0, img.ny - 1) * img.nx * 3;
+                for (int j = 0; j < target_width; ++j) {
+                    const auto & col = columns[j];
+                    const float dx = col.dx;
+                    for (int k = 0; k < 3; ++k) {
+                        float C[4];
+                        for (int t = 0; t < 4; ++t) {
+                            const auto * src = source[t];
+                            const float d0 = src[col.indices[0] + k] - src[col.indices[1] + k];
+                            const float d2 = src[col.indices[2] + k] - src[col.indices[1] + k];
+                            const float d3 = src[col.indices[3] + k] - src[col.indices[1] + k];
+                            const float a0 = src[col.indices[1] + k];
+                            const float a1 = -1.0 / 3 * d0 + d2 - 1.0 / 6 * d3;
+                            const float a2 = 1.0 / 2 * d0 + 1.0 / 2 * d2;
+                            const float a3 = -1.0 / 6 * d0 - 1.0 / 2 * d2 + 1.0 / 6 * d3;
+                            C[t] = a0 + a1 * dx + a2 * dx * dx + a3 * dx * dx * dx;
+                        }
+                        const float d0 = C[0] - C[1], d2 = C[2] - C[1], d3 = C[3] - C[1];
+                        const float a0 = C[1];
+                        const float a1 = -1.0 / 3 * d0 + d2 - 1.0 / 6 * d3;
+                        const float a2 = 1.0 / 2 * d0 + 1.0 / 2 * d2;
+                        const float a3 = -1.0 / 6 * d0 - 1.0 / 2 * d2 + 1.0 / 6 * d3;
+                        const float value = a0 + a1 * dy + a2 * dy * dy + a3 * dy * dy * dy;
+                        dst.buf[(size_t(i) * target_width + j) * 3 + k] =
+                            uint8_t(std::min(std::max(std::round(value), 0.0f), 255.0f));
+                    }
+                }
+            }
+        };
+        int count = 1;
+        if (const char * value = std::getenv("OMNI_VISION_RESIZE_THREADS")) {
+            char * end = nullptr;
+            const long parsed = std::strtol(value, &end, 10);
+            if (end != value && *end == '\0' && parsed >= 1 && parsed <= 8) count = int(parsed);
+        }
+        count = std::min(count, target_height);
+        std::vector<std::thread> workers;
+        for (int t = 1; t < count; ++t) workers.emplace_back(rows, target_height * t / count, target_height * (t + 1) / count);
+        rows(0, target_height / count);
+        for (auto & worker : workers) worker.join();
+        return true;
+    }
+
     // Bicubic resize function
     // part of image will be cropped if the aspect ratio is different
     static bool bicubic_resize(const vision_image_u8 & img, vision_image_u8 & dst, int target_width, int target_height) {
@@ -1747,6 +1840,10 @@ struct image_manipulation {
 
         tx = (float)nx / (float)target_width;
         ty = (float)ny / (float)target_height;
+
+        const char * fast_env = std::getenv("OMNI_VISION_FAST_RESIZE");
+        const bool fast_resize = fast_env && std::strcmp(fast_env, "1") == 0;
+        if (fast_resize) return bicubic_resize_fast(img, dst, target_width, target_height);
 
         // Bicubic interpolation; adapted from ViT.cpp, inspired from :
         //    -> https://github.com/yglukhov/bicubic-interpolation-image-processing/blob/master/libimage.c#L36

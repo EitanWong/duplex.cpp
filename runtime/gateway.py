@@ -392,9 +392,29 @@ async def chat_ws_proxy(ws: WebSocket):
         # 转发请求
         await worker_ws.send(raw)
 
-        # 透传 Worker 的所有响应到前端
-        async for msg_data in worker_ws:
-            await ws.send_text(msg_data)
+        # Watch disconnects while forwarding, including periods when the model
+        # has no output. Closing the worker transport cancels its native turn.
+        async def forward_responses():
+            async for msg_data in worker_ws:
+                await ws.send_text(msg_data)
+
+        async def wait_for_disconnect():
+            while True:
+                incoming = await ws.receive()
+                if incoming['type'] == 'websocket.disconnect':
+                    return
+
+        tasks = [asyncio.create_task(forward_responses()),
+                 asyncio.create_task(wait_for_disconnect())]
+        try:
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                task.result()
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     except WebSocketDisconnect:
         logger.info("Chat WS proxy: client disconnected")
@@ -928,7 +948,7 @@ def _get_audio_meta(rel_path: str, project_root: str) -> Dict[str, Any]:
 
 def _load_audio_base64(rel_path: str, project_root: str) -> Optional[Dict[str, Any]]:
     """加载音频文件为 base64（按需调用）"""
-    import soundfile as sf
+    from core.audio import load_mono_audio
 
     if not rel_path:
         return None
@@ -938,16 +958,8 @@ def _load_audio_base64(rel_path: str, project_root: str) -> Optional[Dict[str, A
         return None
 
     try:
-        audio, sr = sf.read(abs_path, dtype="float32", always_2d=True)
-        audio = audio.mean(axis=1)
-        if sr != 16000:
-            import subprocess
-            converted = subprocess.run(
-                ["/opt/homebrew/bin/ffmpeg", "-v", "error", "-i", abs_path,
-                 "-f", "f32le", "-ar", "16000", "-ac", "1", "pipe:1"],
-                capture_output=True, check=True)
-            audio = np.frombuffer(converted.stdout, dtype=np.float32)
-            sr = 16000
+        audio = load_mono_audio(abs_path)
+        sr = 16000
         audio_bytes = audio.astype(np.float32).tobytes()
         import base64 as b64mod
         return {
@@ -1101,11 +1113,10 @@ async def get_default_ref_audio():
 
     try:
         import base64
-        import librosa
-        import numpy as np
+        from core.audio import load_mono_audio
 
         # 加载并重采样为 16kHz mono float32（与前端上传格式一致）
-        audio, sr = librosa.load(ref_path, sr=16000, mono=True)
+        audio = load_mono_audio(ref_path)
         duration = len(audio) / 16000
 
         # 转换为 base64（PCM float32）

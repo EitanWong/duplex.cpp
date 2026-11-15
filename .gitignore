@@ -26,6 +26,7 @@ dist/
 *.lib
 
 # Weights, recordings, local credentials and machine state
+/.local/
 /models/
 /releases/
 /logs/
@@ -52,6 +53,7 @@ dist/
 *.p12
 *.pfx
 /runtime/certs/
+/runtime/static/lan-ca.crt
 /runtime/config.json
 /runtime/data/
 /runtime/tmp/

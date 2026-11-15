@@ -14,6 +14,8 @@ add_library(omni
             omni.h
             tts-condition-graph.cpp
             tts-condition-graph.h
+            tts-cpu-head.cpp
+            tts-cpu-head.h
             audition.cpp
             audition.h
             vision.cpp
@@ -25,6 +27,43 @@ add_library(omni
             token2wav/token2wav.h
             token2wav/token2wav-profile.h
             )
+
+if(GGML_CUDA)
+    enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    target_sources(omni PRIVATE tts-cuda-head.cu tts-cuda-head.h)
+    target_link_libraries(omni PRIVATE CUDA::cudart)
+    set_target_properties(omni PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+    if(LLAMA_BUILD_TESTS)
+        add_executable(test-tts-cuda-head test/test-tts-cuda-head.cpp tts-cpu-head.cpp)
+        target_link_libraries(test-tts-cuda-head PRIVATE omni)
+        target_include_directories(test-tts-cuda-head PRIVATE .)
+        if(MSVC)
+            target_compile_options(test-tts-cuda-head PRIVATE /fp:strict)
+        endif()
+    endif()
+endif()
+
+# Keep this specialization local. Apple continues using Accelerate; other
+# platforms retain the scalar head unless the AVX2 implementation is compiled.
+if(MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64")
+    set_source_files_properties(tts-cpu-head.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2;/fp:strict")
+endif()
+
+if(LLAMA_BUILD_TESTS)
+    add_executable(test-tts-cpu-head test/test-tts-cpu-head.cpp tts-cpu-head.cpp)
+    target_include_directories(test-tts-cpu-head PRIVATE .)
+    if(MSVC)
+        target_compile_options(test-tts-cpu-head PRIVATE /fp:strict)
+    endif()
+    add_test(NAME test-tts-cpu-head COMMAND test-tts-cpu-head)
+    add_executable(test-vision-encode test/test-vision-encode.cpp)
+    target_link_libraries(test-vision-encode PRIVATE omni)
+    add_executable(test-audio-encode test/test-audio-encode.cpp)
+    target_link_libraries(test-audio-encode PRIVATE omni)
+    add_executable(test-tts-condition test/test-tts-condition.cpp)
+    target_link_libraries(test-tts-condition PRIVATE omni)
+endif()
 
 # Add CoreML related files when enabled
 if(ENABLE_COREML)

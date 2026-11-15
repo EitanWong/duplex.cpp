@@ -18,7 +18,7 @@ llama.cpp-omni，整合 C++ 推理、流式语音生成、打断处理与 WebSoc
 | 平台 | 状态 |
 | --- | --- |
 | Apple Silicon / M5 | 已保留 Metal、CoreML/ANE 与 Accelerate 优化 |
-| Windows / NVIDIA RTX 3060 12 GB | 下一阶段优化目标，性能与兼容性待实机验收 |
+| Windows / NVIDIA RTX 3060 12 GB | 原生 CUDA 编译、GPU 算子与样例回放已验证；人工音质验收待完成 |
 
 长会话语音连续性与音质仍在持续改进。详见
 [Apple 优化基线](docs/apple-silicon.md)和 [NVIDIA 开发指南](docs/nvidia.md)。
@@ -39,13 +39,35 @@ python -m pip install -r runtime/requirements-native.txt
 
 ```bash
 python scripts/configure.py --model-dir /absolute/path/to/MiniCPM-o-4_5-gguf
-./scripts/build-release.sh
-./project-control/start.sh
+./scripts/macos/build.sh
+./scripts/macos/start.sh
 ```
 
 访问 **http://localhost:8040/omni** 并开启麦克风，建议使用耳机。
-通过 `./project-control/status.sh` 查看状态，`./project-control/stop.sh` 停止服务。
+通过 `./scripts/macos/status.sh` 查看状态，`./scripts/macos/stop.sh` 停止服务。
 模型权重需单独下载。
+
+## 快速开始 — Windows / RTX 3060
+
+准备 Python 环境、[模型文件](docs/models.md)、VS 2022 C++ 工具、
+CUDA 12.8+、CMake 与 Ninja 后，在 PowerShell 中运行：
+
+```powershell
+.venv/Scripts/python scripts/configure.py --profile nvidia-rtx3060
+./scripts/windows/build.ps1 -CudaRoot $env:CUDA_PATH
+./scripts/windows/start.ps1
+```
+
+访问启动脚本显示的地址（默认 **http://localhost:8040/omni**）。
+通过 `./scripts/windows/status.ps1` 查看就绪状态，`./scripts/windows/stop.ps1`
+停止全部服务进程；同目录提供可双击的 `.bat` 入口。
+配置采用单 Worker、4096 token 上下文、
+CUDA Flash Attention 与 AVX2 声学输出层。安装说明、实测数据和限制见
+[NVIDIA 指南](docs/nvidia.md)。
+[优化研究报告](docs/inference-optimization.md)说明全链路瓶颈、显存削减、
+CUDA 算子与量化、剪枝的优先级；
+[语音路径实测](docs/voice-optimization-rtx3060.md)记录视觉按需加载和 AVX2 优化。
+其他局域网设备访问请按[说明启用 HTTPS](docs/nvidia.md#private-lan-access--局域网访问)。
 
 ## API
 
@@ -67,7 +89,10 @@ python scripts/configure.py --model-dir /absolute/path/to/MiniCPM-o-4_5-gguf
 详见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 `engine/` 为原生引擎，`runtime/` 为服务与客户端，
-`profiles/apple-m5.json` 保存 Apple 优化配置。
+`profiles/` 保存硬件配置，包括保留的 Apple M5 优化配置。
+平台入口统一放在 `scripts/windows/` 与 `scripts/macos/`。
+详见[脚本索引](scripts/README.md)、[目录规范](docs/project-layout.md)
+和[文档索引](docs/README.md)。
 
 ## 致谢与许可
 

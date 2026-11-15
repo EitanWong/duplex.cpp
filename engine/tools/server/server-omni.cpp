@@ -294,9 +294,10 @@ int main(int argc, char ** argv) {
             return;
         }
 
-        // SSE streaming
+        // The provider runs after this request handler returns. Own the request
+        // values it needs rather than retaining references to stack locals.
         res.set_chunked_content_provider("text/event-stream",
-            [&](size_t, httplib::DataSink & sink) -> bool {
+            [&, debug_dir, round_idx](size_t, httplib::DataSink & sink) -> bool {
                 // reset state
                 {
                     std::lock_guard<std::mutex> lock(state.octx->text_mtx);

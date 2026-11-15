@@ -11,9 +11,9 @@ import subprocess
 import time
 import urllib.request
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 PYTHON = ROOT/'.venv/bin/python'
-SERVICE = ROOT/'scripts/service.py'
+SERVICE = ROOT/'scripts/macos/service.py'
 
 def service(action):
     result = subprocess.run([str(PYTHON), str(SERVICE), action], cwd=ROOT)
@@ -24,7 +24,9 @@ def snapshot():
     spec = importlib.util.spec_from_file_location('project_service', SERVICE)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    path = ROOT/'service-state.json'
+    path = ROOT/'.local/state/macos.json'
+    if not path.exists():
+        path = ROOT/'service-state.json'  # Read-only inspection before migration.
     state = json.loads(path.read_text()) if path.exists() else {}
     return {name:entry for name,entry in state.items() if module.owned(entry)}
 
@@ -39,7 +41,7 @@ def monitors():
             args = shlex.split(parts[1])
         except ValueError:
             continue
-        if len(args) < 2 or args[1] not in ('scripts/runtime_monitor.py',str(ROOT/'scripts/runtime_monitor.py')):
+        if len(args) < 2 or args[1] not in ('scripts/macos/monitor.py',str(ROOT/'scripts/macos/monitor.py')):
             continue
         pid = int(parts[0])
         cwd = subprocess.run(['/usr/sbin/lsof','-a','-p',str(pid),'-d','cwd','-Fn'],capture_output=True,text=True).stdout
@@ -88,7 +90,7 @@ def main():
     parser.add_argument('action',choices=['start','stop','status','restart','help'],nargs='?',default='help')
     args = parser.parse_args()
     if args.action == 'help':
-        print('Usage: minicpm.sh {start|stop|status|restart}\nYou can also run start.sh / stop.sh / status.sh in this folder.')
+        print('Usage: service.sh {start|stop|status|restart}\nYou can also run start.sh / stop.sh / status.sh in this folder.')
         return
     if args.action in ('stop','restart'):
         service('stop')
@@ -108,7 +110,7 @@ def main():
                 return
             time.sleep(1)
         service('stop')
-        raise SystemExit('Startup timed out; services have been stopped. Check project-control/logs/worker.log.')
+        raise SystemExit('Startup timed out; services have been stopped. Check logs/worker.log.')
     state = snapshot()
     monitor = monitors()
     if not state and not monitor:

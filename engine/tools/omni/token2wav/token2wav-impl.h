@@ -1660,6 +1660,7 @@ class flowGGUFModelRunner {
                         const std::string & device);
     void set_num_threads(int n_threads);
     const std::string & backend_name() const { return loader_.backend_name(); }
+    ggml_backend_t backend() const { return loader_.backend(); }
     void set_export_caches_to_host(bool enable) { export_caches_to_host_ = enable; }
     void reset_stream();
     bool setup_cache(const int32_t *       token_bt,
@@ -1683,7 +1684,8 @@ class flowGGUFModelRunner {
                          int                         n_timesteps,
                          float                       temperature,
                          std::vector<float> &        mel_bct_out,
-                         flowStreamCacheHost &       cache_out);
+                         flowStreamCacheHost &       cache_out,
+                         ggml_tensor **              device_output = nullptr);
     bool init_from_host_caches(const flowStreamCacheHost & cache_host,
                                const float *               spk_bc,
                                int64_t                     B,
@@ -2005,6 +2007,12 @@ struct voc_hg2_model {
                                       int32_t             num_threads_in);
     void voc_hg2_model_free();
 };
+struct device_mel_input {
+    ggml_tensor * mel_ctb = nullptr;
+    ggml_tensor * cache_ctb = nullptr;
+    int64_t frames = 0;
+    int64_t cache_frames = 0;
+};
 struct voc_hg2_runner {
     voc_hg2_model * model = nullptr;
     bool voc_hg2_runner_build_graph(ggml_context * ctx,
@@ -2024,7 +2032,8 @@ struct voc_hg2_runner {
                                     std::vector<float> &       out_wave_bt,
                                     int64_t &                  out_T_audio,
                                     std::vector<float> &       out_source_bt1,
-                                    int64_t &                  out_T_source) const;
+                                    int64_t &                  out_T_source,
+                                    const device_mel_input *   device_mel = nullptr) const;
 };
 }  // namespace vocoder
 }  // namespace omni
@@ -2067,7 +2076,10 @@ class Token2Mel {
                                              int                 n_timesteps = -1,
                                              float               temperature = -1.0f);
 
-    bool push_tokens(const int32_t * tokens, int64_t n_tokens, bool is_final, std::vector<float> & mel_bct_out);
+    // Optional device output replaces mel_bct_out; valid until the next flow
+    // inference or stream reset. Consume at most min(ne[1], 2*n_tokens) frames.
+    bool push_tokens(const int32_t * tokens, int64_t n_tokens, bool is_final, std::vector<float> & mel_bct_out,
+                     ggml_tensor ** device_output = nullptr);
 
     bool push_tokens(const std::vector<int32_t> & tokens, bool is_final, std::vector<float> & mel_bct_out) {
         return push_tokens(tokens.data(), (int64_t) tokens.size(), is_final, mel_bct_out);
@@ -2076,6 +2088,7 @@ class Token2Mel {
     void reset_stream();
 
     bool is_ane_mode() const { return backend_kind_ == Backend::ANE; }
+    ggml_backend_t device_backend() const { return is_ane_mode() ? nullptr : runner_.backend(); }
 
     static constexpr int32_t kMelChannels  = 80;
     static constexpr int32_t kSpkDim       = 192;
@@ -2102,7 +2115,8 @@ class Token2Mel {
     enum class Backend { GGUF, ANE };
 
     bool ensure_ready_for_infer() const;
-    bool infer_one_chunk(const std::vector<int32_t> & chunk_bt, bool last_chunk, std::vector<float> & mel_bct);
+    bool infer_one_chunk(const std::vector<int32_t> & chunk_bt, bool last_chunk, std::vector<float> & mel_bct,
+                         ggml_tensor ** device_output = nullptr);
 
     // CoreML 路径：encoder via GGUF runner 输出 mu，DiT × n_timesteps 走 CoreML。
     bool start_stream_ane_(const flowStreamCacheHost & host_cache);
@@ -2196,7 +2210,7 @@ void fade_in_out_b1(std::vector<float> &       wave_inout,
 class Token2Wav {
   public:
     Token2Wav()  = default;
-    ~Token2Wav() = default;
+    ~Token2Wav();
 
     Token2Wav(const Token2Wav &)             = delete;
     Token2Wav & operator=(const Token2Wav &) = delete;
@@ -2239,6 +2253,13 @@ class Token2Wav {
 
     omni::vocoder::voc_hg2_model  voc_model_{};
     omni::vocoder::voc_hg2_runner voc_runner_{};
+
+    void free_device_mel();
+    bool device_mel_enabled_ = false;
+    ggml_context * device_mel_ctx_ = nullptr;
+    ggml_backend_buffer_t device_mel_buf_ = nullptr;
+    ggml_tensor * device_mel_cache_ = nullptr;
+    int64_t device_mel_cache_frames_ = 0;
 
     static constexpr int32_t kMelCacheLen    = 8;
     static constexpr int32_t kSamplesPerMel  = omni::vocoder::hifigan2::hg2_hift_generator::HG2_SAMPLES_PER_MEL;
