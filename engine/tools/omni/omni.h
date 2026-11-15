@@ -171,6 +171,7 @@ using audio_output_cb_t = std::function<void(const float * samples, int n_sample
 
 struct omni_context {
     struct vision_ctx * ctx_vision = NULL;
+    std::chrono::steady_clock::time_point idle_since = std::chrono::steady_clock::now();
     struct audition_ctx * ctx_audio = NULL;
     
     struct llama_context * ctx_llama = NULL;
@@ -521,6 +522,10 @@ void omni_free(struct omni_context * ctx_omni);
 // Stop/join inference threads and clear queues so the same context can serve a
 // new session, without tearing down the loaded model (unlike omni_free).
 void omni_prepare_for_reuse(struct omni_context * ctx_omni);
+
+// Caller holds the context lifecycle lock and has excluded active sessions.
+// Releases only CUDA lazy vision, after all inference threads have been joined.
+bool omni_release_idle_vision(struct omni_context * ctx_omni, int idle_seconds);
 
 // ANE/CoreML warmup — call once after omni_init to pre-load models into NPU
 void omni_warmup_ane(struct omni_context * ctx_omni);

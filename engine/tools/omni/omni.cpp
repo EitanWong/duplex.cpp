@@ -4062,6 +4062,38 @@ static struct llama_model * llama_init_tts(common_params * params, std::string m
     return model;
 }
 
+// Called on the serialized prefill caller before an image is queued to the
+// encoder. The context owns this model until omni_free; session resets retain it.
+static bool omni_load_vision(struct omni_context * ctx_omni) {
+    if (ctx_omni->ctx_vision) return true;
+    const auto started = std::chrono::steady_clock::now();
+    const char * vision_path = ctx_omni->params->vpm_model.c_str();
+    const std::string & coreml_path = ctx_omni->params->vision_coreml_model_path;
+    auto * ctx_vision = vision_init(vision_path, vision_context_params{
+        true, GGML_LOG_LEVEL_INFO, coreml_path.empty() ? nullptr : coreml_path.c_str()});
+    if (!ctx_vision) {
+        LOG_ERR("prefill: failed to load vision model from %s\n", vision_path);
+        return false;
+    }
+    vision_set_batch_encode(ctx_vision, ctx_omni->params->vpm_batch_encode);
+    if (!coreml_path.empty()) {
+        struct stat coreml_stat;
+        if (stat(coreml_path.c_str(), &coreml_stat) == 0) {
+            const char * keep_weights = std::getenv("OMNI_COREML_KEEP_GGML_WEIGHTS");
+            if (keep_weights && std::string(keep_weights) == "1") {
+                vision_set_coreml_model_path(ctx_vision, coreml_path.c_str());
+            }
+            LOG_INF("Vision CoreML initialization requested: %s\n", coreml_path.c_str());
+        } else {
+            LOG_WRN("Vision CoreML model path does not exist: %s, skipping ANE\n", coreml_path.c_str());
+        }
+    }
+    ctx_omni->ctx_vision = ctx_vision;
+    LOG_INF("prefill: vision model loaded in %.2f ms\n",
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
+    return true;
+}
+
 struct omni_context * omni_init(struct common_params * params, int media_type, bool use_tts, std::string tts_bin_dir,
                                 int tts_gpu_layers, const std::string & token2wav_device, bool duplex_mode,
                                 llama_model * existing_model, llama_context * existing_ctx,
@@ -4335,31 +4367,15 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
     ctx_omni->n_past = 0;
     
     if (media_type == 2) {
-        LOG_INF("init vision....");
-        const char * vision_path = ctx_omni->params->vpm_model.c_str();
-        const std::string & coreml_path = ctx_omni->params->vision_coreml_model_path;
-        auto * ctx_vision = vision_init(vision_path, vision_context_params{
-            true, GGML_LOG_LEVEL_INFO, coreml_path.empty() ? nullptr : coreml_path.c_str()});
-        ctx_omni->ctx_vision = ctx_vision;
-
-        // 🔧 [batch encode 开关] 由 common_params 控制（默认关闭）
-        if (ctx_vision) {
-            vision_set_batch_encode(ctx_vision, ctx_omni->params->vpm_batch_encode);
-        }
-
-        // Set CoreML model path if available (for vision ANE acceleration)
-        // Note: .mlmodelc is a directory, not a file, so use stat instead of ifstream
-        if (ctx_vision && !ctx_omni->params->vision_coreml_model_path.empty()) {
-            struct stat coreml_stat;
-            if (stat(ctx_omni->params->vision_coreml_model_path.c_str(), &coreml_stat) == 0) {
-                const char * keep_weights = std::getenv("OMNI_COREML_KEEP_GGML_WEIGHTS");
-                if (keep_weights && std::string(keep_weights) == "1") {
-                    vision_set_coreml_model_path(ctx_vision, coreml_path.c_str());
-                }
-                LOG_INF("Vision CoreML initialization requested: %s\n", coreml_path.c_str());
-            } else {
-                LOG_WRN("Vision CoreML model path does not exist: %s, skipping ANE\n", ctx_omni->params->vision_coreml_model_path.c_str());
-            }
+        bool lazy_vision = false;
+#if defined(GGML_USE_CUDA) && !defined(__APPLE__)
+        const char * lazy = std::getenv("OMNI_VISION_LAZY");
+        lazy_vision = lazy && std::strcmp(lazy, "1") == 0;
+#endif
+        if (lazy_vision) {
+            LOG_INF("prefill: vision loading deferred until the first image\n");
+        } else {
+            omni_load_vision(ctx_omni);
         }
     }
     
@@ -4821,7 +4837,29 @@ void omni_prepare_for_reuse(struct omni_context * ctx_omni) {
         }
     }
 
+    ctx_omni->idle_since = std::chrono::steady_clock::now();
     print_with_timestamp("omni_prepare_for_reuse: inference threads stopped and queues cleared\n");
+}
+
+bool omni_release_idle_vision(struct omni_context * ctx_omni, int idle_seconds) {
+#if defined(GGML_USE_CUDA) && !defined(__APPLE__)
+    const char * lazy = std::getenv("OMNI_VISION_LAZY");
+    if (!ctx_omni || !ctx_omni->ctx_vision || idle_seconds <= 0 ||
+        !lazy || std::strcmp(lazy, "1") != 0 || ctx_omni->duplex || ctx_omni->duplex_session ||
+        ctx_omni->llm_thread.joinable() || ctx_omni->tts_thread.joinable() ||
+        ctx_omni->t2w_thread.joinable() ||
+        std::chrono::steady_clock::now() - ctx_omni->idle_since < std::chrono::seconds(idle_seconds)) {
+        return false;
+    }
+    vision_free(ctx_omni->ctx_vision);
+    ctx_omni->ctx_vision = nullptr;
+    LOG_INF("prefill: released vision after session idle (%d seconds)\n", idle_seconds);
+    return true;
+#else
+    (void) ctx_omni;
+    (void) idle_seconds;
+    return false;
+#endif
 }
 
 void omni_free(struct omni_context * ctx_omni) {
@@ -10548,6 +10586,12 @@ static bool duplex_decode(omni_context * ctx_omni,
 // ============================================================================
 
 bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::string img_fname, int index, int max_slice_nums, std::string text) {
+    // Load before queue submission so failures reach HTTP/WS callers instead of
+    // silently treating an image as audio-only. Audio-only prefill allocates no
+    // vision weights/workspace. The first image pays the cold load once.
+    if (!img_fname.empty() && ctx_omni->media_type == 2 && !omni_load_vision(ctx_omni)) {
+        return false;
+    }
 
     // 🔧 [Duplex Pipeline Stage 1] 路由：
     //   duplex_mode && async && index > 0 && system prompt 已初始化 时，走新 duplex 路径。

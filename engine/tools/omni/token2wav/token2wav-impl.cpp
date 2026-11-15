@@ -6758,8 +6758,18 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
         LOG_ERROR( "voc_hg2_runner_eval_stream: invalid cache_source_bt1 size\n");
         return false;
     }
+    constexpr size_t graph_capacity = GGML_DEFAULT_GRAPH_SIZE * 256;
     ggml_init_params params{};
     params.mem_size    = 2048ull * 1024ull * 1024ull;
+#if defined(GGML_USE_CUDA) && !defined(__APPLE__)
+    if (ggml_backend_is_cuda(model->backend)) {
+        // no_alloc stores only metadata here; tensor payloads use the backend.
+        // Budget for the unchanged graph's full node/leaf capacity and scratch
+        // views rather than committing a 2 GiB host arena for every window.
+        params.mem_size = ggml_graph_overhead_custom(graph_capacity, false) +
+                          (2 * graph_capacity + 64) * ggml_tensor_overhead();
+    }
+#endif
     params.mem_buffer  = nullptr;
     params.no_alloc    = true;
     ggml_context * ctx = ggml_init(params);
@@ -6772,7 +6782,7 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
     ggml_tensor * cache_source_t1_b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, Tc, 1, B);
     ggml_tensor * wave_t_b    = nullptr;
     ggml_tensor * source_t1_b = nullptr;
-    ggml_cgraph * gf = ggml_new_graph_custom(ctx, GGML_DEFAULT_GRAPH_SIZE * 256, false);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, graph_capacity, false);
     // The optional BLAS backend shares CPU buffers. Schedule supported large
     // F32 matrix products there; convolutions and other operations stay on CPU.
     auto sched_deleter = [](ggml_backend_sched_t s) { if (s) ggml_backend_sched_free(s); };
@@ -8389,8 +8399,17 @@ bool flowGGUFModelRunner::init_from_host_caches(const flowStreamCacheHost & cach
         if (std::shared_ptr<flow_matching::fmCausalConditionalCFM> dec = loader_.decoder()) {
             dec->reset_stream_state();
         }
+        constexpr size_t graph_capacity = GGML_DEFAULT_GRAPH_SIZE * 1024;
         ggml_init_params p{};
         p.mem_size   = 2048ull * 1024ull * 1024ull;
+#if defined(GGML_USE_CUDA) && !defined(__APPLE__)
+        if (ggml_backend_is_cuda(loader_.backend())) {
+            // The allocation graph covers both execution graphs' tensors.
+            // Keep all three graph capacities and budget every node and leaf.
+            p.mem_size = 3 * ggml_graph_overhead_custom(graph_capacity, false) +
+                         (2 * graph_capacity + 64) * ggml_tensor_overhead();
+        }
+#endif
         p.mem_buffer = nullptr;
         p.no_alloc   = true;
         sess_->ctx   = ggml_init(p);
@@ -8453,7 +8472,7 @@ bool flowGGUFModelRunner::init_from_host_caches(const flowStreamCacheHost & cach
         ggml_tensor * cpy_conf_att_1 = ggml_cpy(sess_->ctx, out1_conf_att_trim, sess_->conf_att_cache);
         ggml_tensor * cpy_est_cnn_1  = ggml_cpy(sess_->ctx, est_out_nonlast.cnn_cache, sess_->est_cnn_cache);
         ggml_tensor * cpy_est_att_1  = ggml_cpy(sess_->ctx, out1_est_att_trim, sess_->est_att_cache);
-        sess_->gf_nonlast = ggml_new_graph_custom(sess_->ctx, GGML_DEFAULT_GRAPH_SIZE * 1024, false);
+        sess_->gf_nonlast = ggml_new_graph_custom(sess_->ctx, graph_capacity, false);
         ggml_build_forward_expand(sess_->gf_nonlast, sess_->out_feat_nonlast_ctb);
         ggml_build_forward_expand(sess_->gf_nonlast, cpy_conf_cnn_1);
         ggml_build_forward_expand(sess_->gf_nonlast, cpy_conf_att_1);
@@ -8484,14 +8503,14 @@ bool flowGGUFModelRunner::init_from_host_caches(const flowStreamCacheHost & cach
         ggml_tensor * cpy_conf_att_2 = ggml_cpy(sess_->ctx, out2_conf_att_trim, sess_->conf_att_cache);
         ggml_tensor * cpy_est_cnn_2  = ggml_cpy(sess_->ctx, est_out_last.cnn_cache, sess_->est_cnn_cache);
         ggml_tensor * cpy_est_att_2  = ggml_cpy(sess_->ctx, out2_est_att_trim, sess_->est_att_cache);
-        sess_->gf_last = ggml_new_graph_custom(sess_->ctx, GGML_DEFAULT_GRAPH_SIZE * 1024, false);
+        sess_->gf_last = ggml_new_graph_custom(sess_->ctx, graph_capacity, false);
         ggml_build_forward_expand(sess_->gf_last, sess_->out_feat_last_ctb);
         ggml_build_forward_expand(sess_->gf_last, cpy_conf_cnn_2);
         ggml_build_forward_expand(sess_->gf_last, cpy_conf_att_2);
         ggml_build_forward_expand(sess_->gf_last, cpy_est_cnn_2);
         ggml_build_forward_expand(sess_->gf_last, cpy_est_att_2);
 
-        ggml_cgraph * gf_alloc = ggml_new_graph_custom(sess_->ctx, GGML_DEFAULT_GRAPH_SIZE * 1024, false);
+        ggml_cgraph * gf_alloc = ggml_new_graph_custom(sess_->ctx, graph_capacity, false);
         ggml_build_forward_expand(gf_alloc, sess_->out_feat_nonlast_ctb);
         ggml_build_forward_expand(gf_alloc, cpy_conf_cnn_1);
         ggml_build_forward_expand(gf_alloc, cpy_conf_att_1);

@@ -157,12 +157,13 @@ export class AudioPlayer {
             const baseDelayMs = this._getDelayMs();
             // Native packets represent 25 acoustic steps at 25 Hz. The first
             // crossfaded packet can be shorter; cover that known duration
-            // deficit plus observed jitter, with a strict 350 ms startup cap.
+            // deficit plus observed jitter. This reserve is the total startup
+            // cushion; the configured delay already contributes to it.
             const durationMs = resampled.length / this._outputSR * 1000;
             const reserveMs = Math.max(this._adaptiveReserveMs,
                 Math.min(250, Math.max(0, 1040-durationMs)+50));
             const delayMs = baseDelayMs <= 0 ? 0 :
-                Math.min(Math.max(baseDelayMs, 350), baseDelayMs+reserveMs);
+                Math.max(baseDelayMs, reserveMs);
             if (!this._delayTimer) {
                 if (delayMs <= 0) {
                     this._startPlayback();
@@ -230,7 +231,10 @@ export class AudioPlayer {
         const now = this._ctx.currentTime;
         if (this._nextTime < now) {
             const gapMs = (now - this._nextTime) * 1000;
-            if (this._playbackStartTime && this._turnActive && gapMs > 10) {
+            // Creating the first buffer can cross a render quantum before any
+            // audio has been scheduled. That is startup delay, not starvation.
+            if (this._nextTime > this._playbackStartCtxTime &&
+                this._playbackStartTime && this._turnActive && gapMs > 10) {
                 this._adaptiveReserveMs = Math.min(250, Math.max(this._adaptiveReserveMs, gapMs+40));
                 this._underflowTotalMs += gapMs;
                 this._underflowLongestMs = Math.max(this._underflowLongestMs, gapMs);
