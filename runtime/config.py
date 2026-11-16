@@ -22,7 +22,7 @@ Worker 和 Gateway 统一读取此文件。
 import json
 import logging
 import os
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -87,6 +87,10 @@ class AudioConfig(BaseModel):
 class ServiceSectionConfig(BaseModel):
     """服务部署配置"""
 
+    gateway_host: str = Field(default="127.0.0.1", description="Native Windows launcher Gateway bind address")
+    gateway_https: bool = Field(default=False, description="Native Windows launcher HTTPS")
+    gateway_ssl_certfile: str = Field(default="certs/lan-cert.pem", description="Gateway TLS certificate")
+    gateway_ssl_keyfile: str = Field(default="certs/lan-key.pem", description="Gateway TLS private key")
     gateway_port: int = Field(
         default=8006,
         description="Gateway 端口",
@@ -197,6 +201,8 @@ class CppBackendConfig(BaseModel):
         default=99,
         description="GPU offload 层数",
     )
+    native_binary_dir: str = Field(default="", description="Native executable and DLL directory")
+    runtime_env: Dict[str, str] = Field(default_factory=dict, description="Per-worker OMNI/CUDA/thread settings")
 
 
 class DuplexSectionConfig(BaseModel):

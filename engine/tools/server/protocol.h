@@ -15,6 +15,7 @@ using json = nlohmann::ordered_json;
 struct ProtocolMetrics {
     std::string backend = "llama.cpp-omni";
     int kv_cache_length = 0;
+    json kv;
     double prefill_ms = 0.0;
     double generate_ms = 0.0;
     double wall_clock_ms = 0.0;

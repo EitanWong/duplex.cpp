@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -15,6 +16,7 @@
 #include <type_traits>
 #include "session.h"
 #include "protocol.h"
+#include "fact-memory.h"
 #include "token2wav/token2wav.h"
 #include "omni.h"
 #include "common.h"
@@ -116,6 +118,26 @@ static ProtocolMetrics make_runtime_metrics(omni_context * octx,
     metrics.backend = "llama.cpp-omni";
     if (octx) {
         metrics.kv_cache_length = std::max(0, octx->n_past);
+        if (octx->kv_capacity.load() > 0) {
+            metrics.kv = {{"used_cells", octx->kv_used.load()},
+                {"physical_span", octx->kv_physical_span.load()},
+                {"attention_span", octx->kv_attention_span.load()},
+                {"capacity_cells", octx->kv_capacity.load()},
+                {"allocated_bytes", octx->kv_allocated_bytes.load()},
+                {"evictions", octx->kv_evictions.load()},
+                {"evicted_tokens", octx->kv_evicted_tokens.load()},
+                {"unit_fallbacks", octx->kv_unit_fallbacks.load()},
+                {"prune_metadata_ms", octx->kv_prune_ms.load()},
+                {"completed_turns", octx->kv_completed_turn.load()},
+                {"memory_injections", octx->memory_injections.load()},
+                {"memory_tokens", octx->memory_tokens.load()},
+                {"memory_prefill_ms", octx->memory_prefill_ms.load()},
+                {"memory_retrieval_ms", octx->memory_retrieval_ms.load()},
+                {"accounted_tokens", octx->kv_accounted_tokens.load()},
+                {"input_queue_ms", octx->input_queue_ms.load()},
+                {"llm_queue_ms", octx->llm_queue_ms.load()},
+                {"input_age_ms", octx->input_age_ms.load()}};
+        }
         metrics.n_tts_tokens = (int)octx->tts_all_generated_tokens.size();
         if (vision_slices > 0 && octx->ctx_vision) {
             metrics.vision_tokens = vision_slices * vision_n_output_tokens(octx->ctx_vision);
@@ -172,6 +194,11 @@ static void stop_reusable_octx_threads(omni_context * octx) {
     omni_prepare_for_reuse(octx);
 }
 
+static bool runtime_option_enabled(const char * name) {
+    const char * value = std::getenv(name);
+    return value && std::strcmp(value, "1") == 0;
+}
+
 // Keep the native duplex header and reference-audio boundaries intact. Custom
 // instructions belong in the system text before the reference audio embeddings.
 static void configure_native_duplex_prompt(omni_context * octx, const std::string & system_prompt) {
@@ -192,6 +219,10 @@ static void reset_octx_for_session(omni_context * octx, const ParsedSessionInit 
     stop_reusable_octx_threads(octx);
 
     const bool duplex_mode = (init.mode == "full_duplex");
+    const bool keep_text_kv = !duplex_mode && !octx->duplex_mode &&
+                              runtime_option_enabled("OMNI_TEXT_PREFIX_CACHE") &&
+                              !octx->text_prompt_cache.empty();
+    if (!keep_text_kv) octx->text_prompt_cache.clear();
     octx->async = true;
     octx->duplex_mode = duplex_mode;
     octx->base_output_dir = output_dir;
@@ -208,6 +239,7 @@ static void reset_octx_for_session(omni_context * octx, const ParsedSessionInit 
     octx->simplex_round_idx = 0;
     octx->wav_turn_base = 0;
     octx->round_start_positions.clear();
+    sliding_window_reset(octx);
     octx->force_listen_used = 0;
     octx->audio_epoch.store(0);
     octx->force_listen_override = false;
@@ -227,7 +259,7 @@ static void reset_octx_for_session(omni_context * octx, const ParsedSessionInit 
 
     if (octx->ctx_llama) {
         llama_memory_t mem = llama_get_memory(octx->ctx_llama);
-        if (mem) {
+        if (mem && !keep_text_kv) {
             llama_memory_clear(mem, /*data=*/false);
         }
     }
@@ -527,6 +559,10 @@ static void configure_turn_based_prompt(omni_context * octx,
         octx->audio_assistant_prompt = "<|audio_end|>你的任务是用这种声音模式来当一个助手。请认真、高质量地回复用户的问题。请用高自然度的方式和用户聊天。你是由面壁智能开发的人工智能助手：面壁小钢炮。<|im_end|>\n<|im_start|>user\n";
         octx->omni_voice_clone_prompt = "<|im_start|>system\n模仿音频样本的音色并生成新的内容。\n<|audio_start|>";
         octx->omni_assistant_prompt = "<|audio_end|>你的任务是用这种声音模式来当一个助手。请认真、高质量地回复用户的问题。请用高自然度的方式和用户聊天。<|im_end|>\n<|im_start|>user\n";
+        if (!system_text.empty()) {
+            octx->omni_assistant_prompt = "<|audio_end|>" + system_text + "<|im_end|>\n<|im_start|>user\n";
+            octx->audio_assistant_prompt = octx->omni_assistant_prompt;
+        }
         return;
     }
 
@@ -562,7 +598,8 @@ static omni_context * create_session_octx(common_params & params, const ParsedSe
 
     // Reuse the server-owned context if it matches this session's mode (avoids
     // reloading the model); otherwise tear it down and build a fresh one.
-    if (shared_octx && shared_octx->duplex_mode == duplex_mode && shared_octx->use_tts == use_tts) {
+    if (shared_octx && shared_octx->use_tts == use_tts &&
+        (shared_octx->duplex_mode == duplex_mode || runtime_option_enabled("OMNI_REUSE_MODELS"))) {
         reset_octx_for_session(shared_octx, init, output_dir);
         apply_session_config(p, shared_octx, init, sampling_defaults);
         LOG_INF("create_session_octx: reused shared octx, duplex=%d, output_dir=%s\n",
@@ -686,8 +723,10 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
         return;
     }
 
-    // Full-duplex requires index=0 prefill before the first frame. This
-    // initializes the system prompt and starts the duplex encoder/LLM pipeline.
+    // Turn-based prompts depend on the first input's TTS setting and system
+    // message. Retain its reference until that prompt has been configured.
+    std::string turn_voice_wav;
+    // Full-duplex requires index=0 prefill before the first frame.
     if (parsed_init.mode == "full_duplex" || !parsed_init.ref_audio_b64.empty()) {
         std::string voice_wav;
         if (!parsed_init.ref_audio_b64.empty()) {
@@ -697,16 +736,21 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             fail_fast(session_id, "voice_audio_decode_failed");
             return;
         }
-        std::lock_guard<std::mutex> lock(octx_mutex);
-        if (!stream_prefill(octx, voice_wav, /*img*/"", /*index*/0)) {
-            LOG_ERR("WS /backend: voice prefill failed\n");
+        if (parsed_init.mode == "turn_based") {
+            turn_voice_wav = voice_wav;
+            if (!voice_wav.empty()) retained_media_files.push_back(voice_wav);
+        } else {
+            std::lock_guard<std::mutex> lock(octx_mutex);
+            if (!stream_prefill(octx, voice_wav, /*img*/"", /*index*/0)) {
+                LOG_ERR("WS /backend: voice prefill failed\n");
+                if (!voice_wav.empty()) fs::remove(voice_wav);
+                fail_fast(session_id, "voice_prefill_failed");
+                return;
+            }
             if (!voice_wav.empty()) fs::remove(voice_wav);
-            fail_fast(session_id, "voice_prefill_failed");
-            return;
-        }
-        if (!voice_wav.empty()) fs::remove(voice_wav);
-        if (octx->llm_thread_info) {
-            octx->llm_thread_info->start = std::chrono::steady_clock::now();
+            if (octx->llm_thread_info) {
+                octx->llm_thread_info->start = std::chrono::steady_clock::now();
+            }
         }
     }
 
@@ -740,6 +784,8 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
         httplib::ws::WebSocket * ws = nullptr;
         omni_context * octx = nullptr;
         std::mutex mtx;
+        std::condition_variable audio_done_cv;
+        bool final_audio = false;
         std::chrono::steady_clock::time_point response_start = std::chrono::steady_clock::now();
         // Non-streaming turn-based + TTS: accumulate PCM here and emit it as
         // response.done.audio (full_audio_b64) instead of streaming deltas.
@@ -761,6 +807,10 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                 if (samples && n_samples > 0) {
                     audio_state->accum.insert(audio_state->accum.end(),
                                               samples, samples + n_samples);
+                }
+                if (is_final) {
+                    audio_state->final_audio = true;
+                    audio_state->audio_done_cv.notify_all();
                 }
                 return;
             }
@@ -791,6 +841,11 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                 {"samples", n_samples}, {"sample_rate", sample_rate}};
             audio_state->ws->send(ev.dump());
         }
+        if (is_final) {
+            std::lock_guard<std::mutex> lk(audio_state->mtx);
+            audio_state->final_audio = true;
+            audio_state->audio_done_cv.notify_all();
+        }
     };
 
     // ================================================================
@@ -798,6 +853,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
     // ================================================================
     std::string raw;
     int response_seq = 0;
+    omni_fact_memory fact_memory;
 
     while (true) {
         read_result = ws.read(raw);
@@ -819,6 +875,20 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             msg_type = msg.at("type").get<std::string>();
         }
 
+        if (msg_type == "memory.update") {
+            if (parsed_init.mode != "full_duplex" || !runtime_option_enabled("OMNI_TEXT_MEMORY") ||
+                octx->sliding_window_config.mode != "turn") {
+                send_event({{"type", "memory.error"}, {"error", "text memory requires full_duplex, OMNI_TEXT_MEMORY=1 and OMNI_DUPLEX_WINDOW=turn"}});
+                continue;
+            }
+            try {
+                fact_memory.update(msg.at("facts"), octx->kv_completed_turn.load());
+                send_event({{"type", "memory.updated"}, {"revision", fact_memory.revision()}, {"facts", fact_memory.size()}});
+            } catch (const std::exception & error) {
+                send_event({{"type", "memory.error"}, {"error", error.what()}});
+            }
+            continue;
+        }
         if (msg_type != "input.append") {
             // Unknown or invalid type after init → fail-fast
             LOG_ERR("WS /backend: unexpected message type '%s' from session %s\n",
@@ -841,6 +911,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             audio_state->response_id = response_id; // update for audio callback
             audio_state->response_start = t_request_start;
             audio_state->emitted_audio = false;
+            audio_state->final_audio = false;
         }
 
         // Branch: full_duplex vs turn_based. The input shape MUST match the
@@ -941,8 +1012,35 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                 const bool prev_use_tts = octx->use_tts;
                 octx->use_tts = parsed_input.use_tts_template;
                 configure_turn_based_prompt(octx, parsed_input.use_tts_template, system_text);
-                if (!octx->system_prompt_initialized) {
-                    if (!stream_prefill(octx, /*aud*/"", /*img*/"", /*index*/0)) {
+                bool cached_text = runtime_option_enabled("OMNI_TEXT_PREFIX_CACHE") &&
+                                   !parsed_input.use_tts_template && tmp_files.audio_path.empty() &&
+                                   tmp_files.image_path.empty() && extra_image_paths.empty();
+                for (const auto & msg : parsed_msgs) {
+                    cached_text = cached_text && msg.image_b64s.empty() && msg.audio_b64s.empty() && msg.video_b64s.empty();
+                }
+                if (cached_text) {
+                    octx->async = false;
+                    int reused_tokens = 0;
+                    if (!omni_prefill_text_cached(octx, prompt, reused_tokens)) {
+                        octx->text_prompt_cache.clear();
+                        octx->use_tts = prev_use_tts;
+                        fail_fast(session_id, "text_prefill_failed");
+                        return;
+                    }
+                } else {
+                    // Cached text KV may have survived session.init, before the
+                    // input modality/template was known. Clear it on fallback.
+                    if (!octx->text_prompt_cache.empty()) {
+                        octx->text_prompt_cache.clear();
+                        llama_memory_clear(llama_get_memory(octx->ctx_llama), false);
+                        octx->n_past = octx->n_keep = 0;
+                        octx->system_prompt_initialized = false;
+                    }
+                    octx->async = true;
+                }
+                if (!cached_text && !octx->system_prompt_initialized) {
+                    const std::string ref = parsed_input.use_tts_template ? turn_voice_wav : "";
+                    if (!stream_prefill(octx, ref, /*img*/"", /*index*/0)) {
                         octx->use_tts = prev_use_tts;
                         tmp_files.cleanup();
                         for (const auto & path : extra_image_paths) fs::remove(path);
@@ -952,7 +1050,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                     }
                 }
                 int input_index = msg_counter > 0 ? msg_counter : ++msg_counter;
-                if (!stream_prefill(octx, tmp_files.audio_path, tmp_files.image_path,
+                if (!cached_text && !stream_prefill(octx, tmp_files.audio_path, tmp_files.image_path,
                                     input_index, parsed_input.max_slice_nums, prompt)) {
                     octx->use_tts = prev_use_tts;
                     tmp_files.cleanup();
@@ -1079,8 +1177,16 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                                              turn_vision_slices)));
                 }
             }
-            if (parsed_input.use_tts_template) {
-                if (!omni_duplex_drain_tts_audio(octx, /*max_wait_ms*/120000, /*idle_ms*/3000)) {
+            if (parsed_input.use_tts_template && !full_text.empty()) {
+                // The final PCM callback is a completion signal. Queue
+                // emptiness cannot distinguish idle workers from active work.
+                std::unique_lock<std::mutex> lk(audio_state->mtx);
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+                while (!audio_state->final_audio && session_mgr.get(session_id) != nullptr &&
+                       std::chrono::steady_clock::now() < deadline) {
+                    audio_state->audio_done_cv.wait_for(lk, std::chrono::milliseconds(100));
+                }
+                if (!audio_state->final_audio && session_mgr.get(session_id) != nullptr) {
                     LOG_WRN("WS /backend: timed out waiting for TTS audio drain for session %s\n",
                             session_id.c_str());
                 }
@@ -1127,6 +1233,20 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                 return;
             }
 
+            if (runtime_option_enabled("OMNI_TEXT_MEMORY") && octx->sliding_window_config.mode == "turn") {
+                const auto & input = msg.at("input");
+                if (input.contains("memory_query") && (!input["memory_query"].is_string() || input["memory_query"].get<std::string>().size() > 2048)) {
+                    fail_fast(session_id, "invalid_memory_query");
+                    return;
+                }
+                const auto retrieval_started = std::chrono::steady_clock::now();
+                // Reserve the two unit delimiters inside the 512-token budget.
+                const auto selected = fact_memory.retrieve(input.value("memory_query", std::string()), 510,
+                    [&](const std::string & text) { return (int)common_tokenize(octx->ctx_llama, text, false, false).size(); });
+                octx->memory_retrieval_ms.store(octx->memory_retrieval_ms.load() + elapsed_ms(retrieval_started));
+                std::lock_guard<std::mutex> lock(octx->memory_mutex);
+                octx->memory_pending_text = selected;
+            }
             TempMediaFiles tmp_files;
             int input_index = ++msg_counter;
             octx->trace_input.store(input_index);
@@ -1185,8 +1305,9 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             }
 
             const auto t_generate_start = std::chrono::steady_clock::now();
-            std::thread decode_thread([octx, debug_dir]() {
-                stream_decode(octx, debug_dir, -1);
+            bool decode_ok = false;
+            std::thread decode_thread([octx, debug_dir, &decode_ok]() {
+                decode_ok = stream_decode(octx, debug_dir, -1);
             });
 
             // Collect full text for response.done
@@ -1215,15 +1336,9 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
 
                 if (!frag.empty()) {
                     if (frag == "__IS_LISTEN__") {
-                        // Model switched to listen
+                        // Decode can enqueue its text after this marker. Drain
+                        // the complete input before sending its final decision.
                         step_listen = true;
-                        send_event(make_listen_delta(
-                            session_id, response_id,
-                            make_runtime_metrics(octx, prefill_ms,
-                                                 elapsed_ms(t_generate_start),
-                                                 elapsed_ms(t_request_start), 0,
-                                                 turn_vision_slices)));
-                        break; // Done for this input
                     } else if (frag == "__END_OF_TURN__") {
                         // Turn ended — will be handled by response.done
                     } else {
@@ -1255,6 +1370,10 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             if (decode_thread.joinable()) {
                 decode_thread.join();
             }
+            if (!decode_ok) {
+                fail_fast(session_id, "decode_failed");
+                return;
+            }
             double generate_ms = elapsed_ms(t_generate_start);
             {
                 const std::string text = sanitize_utf8_stream(utf8_pending, "", true);
@@ -1273,7 +1392,15 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                 std::lock_guard<std::mutex> lk(audio_state->mtx);
                 emitted_audio = audio_state->emitted_audio;
             }
-            if (!step_listen) {
+            if (step_listen) {
+                json listen_event = make_listen_delta(
+                    session_id, response_id,
+                    make_runtime_metrics(octx, prefill_ms, generate_ms,
+                                         elapsed_ms(t_request_start), 0,
+                                         turn_vision_slices));
+                listen_event["text"] = full_text;
+                send_event(listen_event);
+            } else {
                 // Full-duplex speak responses also need an explicit completion
                 // boundary; pure listen steps are represented by listen delta only.
                 json done_event = make_response_done(

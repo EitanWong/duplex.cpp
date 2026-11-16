@@ -1,5 +1,11 @@
 # Duplex API quick reference
 
+For authenticated `/v1/realtime` on port 8006, see [ModelBest Realtime](modelbest-realtime.md)
+(official audio/video event format) or [OpenAI Realtime](realtime.md) (GA/Beta audio events).
+Both include LAN WSS and Internet proxy configuration. Select the protocol with the
+`model` query parameter: `MiniCPM-o-4.5-Realtime` or `gpt-realtime` respectively.
+ModelBest and the native API below use 16 kHz float32 input; OpenAI uses 24 kHz PCM16.
+
 The public gateway exposes `ws://localhost:8040/ws/duplex/{session_id}`.
 Use a unique `adx_`-prefixed ID for audio-only sessions or `omni_` for audio/video.
 One session occupies one worker. Listen and send concurrently; do not wait for a
@@ -21,6 +27,9 @@ speech response before forwarding the next microphone chunk.
 
 Optionally add `frame_base64_list: ["<base64 JPEG>"]` to an audio chunk.
 Use `force_listen: true` to interrupt speaking and force listening.
+Live voice/video pages use continuous one-second input by default. `?endpoint=1`
+opts into experimental early endpoint padding, which can suppress replies after
+spoken interruptions.
 
 | Incoming event | Handling |
 | --- | --- |
@@ -31,8 +40,15 @@ Use `force_listen: true` to interrupt speaking and force listening.
 | `stopped` | Session released |
 
 Speech is streamed separately from text decisions; `result.audio_data` may be empty.
+Keep any nonempty `result.text` even when `is_listen` is true: the model can
+finish speaking and return to listening within the same input chunk.
 Honor `speech_end` metadata when present. The native `engine` WebSocket `/backend`
 is an internal protocol and uses different messages and raw PCM encoding.
+
+The native protocol also has an opt-in, session-local `memory.update` event and
+`metrics.kv` diagnostics. The Python native Worker exposes `duplex_update_memory`;
+the public Gateway/browser does not automatically transcribe or submit facts.
+See the [memory schema and limits](long-session-rtx3060.md#可用的实验文本记忆).
 
 The browser client also supports the existing short-frame endpointing mode.
 For a first integration, use the one-second messages above. See `runtime/worker.py`
@@ -42,7 +58,11 @@ and `runtime/static/duplex/lib/duplex-session.js` for the current implementation
 
 连接后依次等待 `queue_done`、发送 `prepare`、等待 `prepared`，然后持续发送
 1 秒、16 kHz、单声道 float32 小端 PCM 的 Base64 数据（字段为 `audio_base64`）。
+实时语音和视频页面默认连续发送一秒输入；`?endpoint=1` 启用实验性提前端点补零，
+此路径可能在直接插话后持续聆听而不回复。
 收音和播放必须并行。语音经独立 `audio_only` 事件发送，`audio_data` 为
 24 kHz 单声道 float32 小端原始 PCM，不含 WAV 文件头，也不保证包含在 `result` 内。
+即使 `is_listen` 为 `true`，也应保留非空的 `result.text`：模型可能在同一输入片段内
+完成回复后转回聆听。
 打断时清空旧播放队列，
 并利用 `audio_epoch` 隔离过期输出。远程部署使用带认证的 HTTPS/WSS 反向代理。

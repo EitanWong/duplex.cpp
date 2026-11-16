@@ -5,6 +5,9 @@
 #include "common/log.h"
 #include "ggml-backend.h"
 
+#include <cstdlib>
+#include <cstring>
+
 static struct ggml_tensor * tts_condition_graph_build_l2_normalize(
         struct ggml_context * ctx,
         struct ggml_tensor  * x,
@@ -28,10 +31,11 @@ static struct ggml_cgraph * tts_condition_graph_build(
         struct ggml_tensor  ** out_merged) {
     struct ggml_cgraph * gf = ggml_new_graph(ctx);
 
-    struct ggml_tensor * llm_embeds = ggml_get_rows(
-        ctx,
-        ctx_omni->tts_condition_graph.emb_text_weight,
-        token_ids);
+    // In host-gather mode token_ids is already a compact F32 embedding input.
+    // Keep the projector/normalization/addition on the original backend.
+    struct ggml_tensor * llm_embeds = ctx_omni->tts_condition_graph.emb_text_weight
+        ? ggml_get_rows(ctx, ctx_omni->tts_condition_graph.emb_text_weight, token_ids)
+        : token_ids;
 
     struct ggml_tensor * projected = ggml_mul_mat(
         ctx,
@@ -91,6 +95,24 @@ bool tts_condition_graph_init(struct omni_context * ctx_omni) {
     model.tts_hidden_dim  = ctx_omni->emb_text_hidden_size;
     model.text_vocab_size = ctx_omni->emb_text_vocab_size;
     model.backend         = ctx_omni->projector.backend;
+
+    const char * host_embed = std::getenv("OMNI_TTS_HOST_EMBED");
+    const bool gather_on_host = host_embed && std::strcmp(host_embed, "1") == 0 &&
+                               std::strncmp(ggml_backend_name(model.backend), "CUDA", 4) == 0;
+    if (gather_on_host) {
+        // emb_text is already resident on the host for native TTS. Upload only
+        // the requested rows instead of duplicating the entire vocabulary in
+        // VRAM. This copies F32 bytes; it introduces no quantization.
+        model.galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+        if (!model.galloc) {
+            fail("failed to create host-gather allocator");
+            return false;
+        }
+        model.initialized = true;
+        LOG_INF("TTS condition graph: host gather, avoided %.2f MiB CUDA weight buffer\n",
+                size_t(model.text_vocab_size) * model.tts_hidden_dim * sizeof(float) / 1048576.0);
+        return true;
+    }
 
     const size_t ctx_size = ggml_tensor_overhead() * 1;
     struct ggml_init_params ctx_params = {
@@ -228,7 +250,10 @@ bool tts_condition_graph_forward(
         return false;
     }
 
-    struct ggml_tensor * token_ids_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+    const bool gather_on_host = model.emb_text_weight == nullptr;
+    struct ggml_tensor * token_ids_tensor = gather_on_host
+        ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, out_dim, n_tokens)
+        : ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
     ggml_set_name(token_ids_tensor, "tts_condition_token_ids");
     ggml_set_input(token_ids_tensor);
 
@@ -262,13 +287,19 @@ bool tts_condition_graph_forward(
         return false;
     }
 
-    std::vector<int32_t> token_ids_i32(n_tokens);
-    for (int i = 0; i < n_tokens; ++i) {
-        token_ids_i32[i] = (int32_t) token_ids[i];
-    }
-
     const float eps = 1e-8f;
-    ggml_backend_tensor_set(token_ids_tensor, token_ids_i32.data(), 0, token_ids_i32.size() * sizeof(int32_t));
+    if (gather_on_host) {
+        std::vector<float> rows(output_size);
+        for (int i = 0; i < n_tokens; ++i) {
+            std::memcpy(rows.data() + size_t(i) * out_dim,
+                        ctx_omni->emb_text_weight + size_t(token_ids[i]) * out_dim,
+                        size_t(out_dim) * sizeof(float));
+        }
+        ggml_backend_tensor_set(token_ids_tensor, rows.data(), 0, rows.size() * sizeof(float));
+    } else {
+        std::vector<int32_t> token_ids_i32(token_ids, token_ids + n_tokens);
+        ggml_backend_tensor_set(token_ids_tensor, token_ids_i32.data(), 0, token_ids_i32.size() * sizeof(int32_t));
+    }
     ggml_backend_tensor_set(hidden_tensor, llm_hidden_states, 0, (size_t) n_tokens * (size_t) llm_n_embd * sizeof(float));
     ggml_backend_tensor_set(eps_tensor, &eps, 0, sizeof(float));
 

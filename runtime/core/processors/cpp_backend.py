@@ -207,6 +207,8 @@ class CppBackendWorker:
         cpp_server_port: Optional[int] = None,
         ctx_size: int = 32768,
         n_gpu_layers: int = 99,
+        native_binary_dir: str = "",
+        runtime_env: Optional[Dict[str, str]] = None,
         **kwargs,
     ):
         self.llamacpp_root = llamacpp_root
@@ -217,6 +219,11 @@ class CppBackendWorker:
         self.llm_model = llm_model or self._auto_detect_llm_model(model_dir)
         self.ctx_size = ctx_size
         self.n_gpu_layers = n_gpu_layers
+        self.native_binary_dir = native_binary_dir
+        self.runtime_env = dict(runtime_env or {})
+        allowed = ("OMNI_", "GGML_CUDA_", "CUDA_", "OMP_", "OPENBLAS_", "MKL_")
+        if any(not key.startswith(allowed) for key in self.runtime_env):
+            raise ValueError("runtime_env accepts only inference and thread settings")
 
         from worker import WorkerState, WorkerStatus
         self.state = WorkerState()
@@ -318,7 +325,8 @@ class CppBackendWorker:
         if previous:
             previous.close()
         self._native_duplex = NativeDuplex(
-            self, system_prompt_text, ref_audio_path, sampling, length_penalty
+            self, system_prompt_text, ref_audio_path, sampling, length_penalty,
+            tts_ref_audio_path=prompt_wav_path,
         )
         self._native_duplex_used = True
         self._native_duplex_reusable = False
@@ -373,6 +381,13 @@ class CppBackendWorker:
 
         self._cleanup_temp_files(temp_audio, temp_image)
         return {"n_vision_images": n_vision_images}
+
+    def duplex_update_memory(self, facts, query=''):
+        """Experimental typed-user/external-transcript facts; call between steps."""
+        native = getattr(self, '_native_duplex', None)
+        if native is None:
+            raise RuntimeError('An active native duplex session is required')
+        return native.update_memory(facts, query)
 
     def duplex_generate(self, force_listen: bool = False) -> "DuplexGenerateResult":
         """Duplex 生成 → /v1/stream/decode + scan WAV files"""
@@ -615,6 +630,14 @@ class CppBackendWorker:
         """Half-Duplex 生成：流式读取 SSE 文本，同时交错 yield 已生成的 WAV 音频"""
         from core.schemas.streaming import StreamingChunk
         import soundfile as sf
+
+        native_request = getattr(self, '_native_chat_request', None)
+        if native_request is not None:
+            from .native_chat import stream_chat
+            self._native_chat_request = None
+            yield from stream_chat(self, native_request, max_new_tokens=max_new_tokens,
+                                   generate_audio=generate_audio, length_penalty=length_penalty)
+            return
 
         t0 = time.perf_counter()
         cur_round = self._round_number
@@ -883,11 +906,22 @@ class CppBackendWorker:
                      ref_audio_path: Optional[str] = None,
                      reset_context: bool = True,
                      system_content: Any = None,
-                     sampling: Optional[Dict[str, Any]] = None) -> str:
+                     sampling: Optional[Dict[str, Any]] = None,
+                     native_messages=None) -> str:
         """Chat prefill — reset_context=True 时重置会话上下文
 
         system_content: 如未提供，自动从 msgs 中的 system role 提取 content
         """
+        if native_messages is not None:
+            self._native_chat_request = {
+                'messages': native_messages,
+                'ref_audio_path': ref_audio_path or self.ref_audio_path,
+                'sampling': sampling or {},
+                'max_slice_nums': max_slice_nums if max_slice_nums is not None else -1,
+                'enable_thinking': enable_thinking,
+                'cancel': threading.Event(),
+            }
+            return 'prefilled'
         media_type = 2
         # 自动从 msgs 抽取 system content 作为 prompt 构造依据
         effective_system_content = system_content
@@ -948,8 +982,35 @@ class CppBackendWorker:
                     cnt += 1
         return "prefilled"
 
+    def cancel_native_chat(self):
+        request = (getattr(self, '_active_native_chat_request', None) or
+                   getattr(self, '_native_chat_request', None))
+        if request is not None:
+            request['cancel'].set()
+        session_id = getattr(self, '_active_native_chat_session', None)
+        if session_id:
+            response = self._http_client.post(
+                self._cpp_server_url + '/sessions/' + session_id + '/close', timeout=30)
+            if response.status_code not in (200, 404):
+                response.raise_for_status()
+
     def chat_non_streaming_generate(self, session_id, **kwargs):
         """Chat 非流式生成"""
+        native_request = getattr(self, '_native_chat_request', None)
+        if native_request is not None:
+            from .native_chat import stream_chat
+            self._native_chat_request = None
+            text, audio = [], []
+            for chunk in stream_chat(self, native_request, streaming=False,
+                                     max_new_tokens=kwargs.get('max_new_tokens', 256),
+                                     generate_audio=kwargs.get('generate_audio', False),
+                                     length_penalty=kwargs.get('length_penalty', 1.1)):
+                if chunk.text_delta:
+                    text.append(chunk.text_delta)
+                if chunk.audio_data:
+                    audio.append(base64.b64decode(chunk.audio_data))
+            result = ''.join(text)
+            return (result, np.frombuffer(b''.join(audio), dtype='<f4')) if audio else result
         cur_round = self._round_number
         length_penalty = float(kwargs.get("length_penalty", 1.1) or 1.1)
         resp = self._http_client.post(
@@ -996,7 +1057,11 @@ class CppBackendWorker:
             raise RuntimeError(f"LLM model not found: {model_path}")
 
         env = os.environ.copy()
+        for key, value in self.runtime_env.items():
+            env.setdefault(key, value)
         env["CUDA_VISIBLE_DEVICES"] = str(self.gpu_id)
+        if platform.system() == "Windows":
+            env["PATH"] = os.path.dirname(server_bin) + os.pathsep + env.get("PATH", "")
 
         cmd = [
             server_bin,
@@ -1009,14 +1074,23 @@ class CppBackendWorker:
             "--temp", "0.7",
         ]
 
-        if platform.system() == "Darwin":
-            cache_type = os.environ.get("OMNI_LLM_KV_TYPE", "f16")
-            if cache_type not in ("f16", "q8_0"):
-                raise ValueError("OMNI_LLM_KV_TYPE must be f16 or q8_0")
-            cmd += ["--threads", os.environ.get("OMNI_CPU_THREADS", "4"),
-                    "--threads-batch", os.environ.get("OMNI_CPU_THREADS", "4"),
-                    "--flash-attn", "on",
-                    "--cache-type-k", cache_type, "--cache-type-v", cache_type]
+        kv_variables = ("OMNI_LLM_KV_TYPE", "OMNI_LLM_K_TYPE", "OMNI_LLM_V_TYPE")
+        if platform.system() == "Darwin" or "OMNI_FLASH_ATTN" in env or any(key in env for key in kv_variables):
+            cache_type = env.get("OMNI_LLM_KV_TYPE", "f16")
+            cache_types = {key: env.get(key, cache_type) for key in kv_variables[1:]}
+            for key, value in {kv_variables[0]: cache_type, **cache_types}.items():
+                if value not in ("f16", "q8_0"):
+                    raise ValueError(f"{key} must be f16 or q8_0")
+            cmd += ["--threads", env.get("OMNI_CPU_THREADS", "4"),
+                    "--threads-batch", env.get("OMNI_CPU_THREADS_BATCH", env.get("OMNI_CPU_THREADS", "4")),
+                    "--flash-attn", env.get("OMNI_FLASH_ATTN", "on"),
+                    "--cache-type-k", cache_types["OMNI_LLM_K_TYPE"],
+                    "--cache-type-v", cache_types["OMNI_LLM_V_TYPE"]]
+        for variable, option in (("OMNI_BATCH_SIZE", "--batch-size"),
+                                 ("OMNI_UBATCH_SIZE", "--ubatch-size"),
+                                 ("OMNI_SAMPLER_SEED", "--seed")):
+            if variable in env:
+                cmd += [option, env[variable]]
 
         logger.info(f"Starting C++ server: {' '.join(cmd)}")
 
@@ -1035,7 +1109,9 @@ class CppBackendWorker:
                     stripped = line.rstrip()
                     startup_lines.append(stripped)
                     del startup_lines[:-40]
-                    if any(kw in stripped for kw in ("[continuity]", "[timing]", "[prof] encoder", "TTS", "T2W", "LLM->TTS", "wav_", "tts_thread", "generate_audio", "speek_done", "break_event", "lang", "language", "omni_set_language", "prefill", "change")):
+                    if any(kw in stripped.lower() for kw in ("ggml_assert", "assertion", "cuda error", "terminate", "error:", "abort")):
+                        logger.error(f"[CPP] {stripped}")
+                    elif any(kw in stripped for kw in ("[continuity]", "[timing]", "[prof] encoder", "TTS", "T2W", "LLM->TTS", "wav_", "tts_thread", "generate_audio", "speek_done", "break_event", "lang", "language", "omni_set_language", "prefill", "change", "prefix cache", "reused shared")):
                         logger.info(f"[CPP] {stripped}")
                     else:
                         logger.debug(f"[CPP] {stripped}")
@@ -1069,16 +1145,19 @@ class CppBackendWorker:
         # [Windows fix] Visual Studio 多配置生成器把 EXE 放在 build/bin/Release/llama-server.exe
         # 上游候选只列了无后缀的 POSIX 名，os.path.exists 会失败导致回退到第 0 个不存在的路径，
         # 之后 _start_cpp_server 抛 "llama-server not found"。这里补全 Windows 路径。
-        release_dir = os.environ.get("OMNI_NATIVE_RELEASE_DIR")
+        is_win = platform.system() == "Windows"
+        release_dir = os.environ.get("OMNI_NATIVE_RELEASE_DIR") or self.native_binary_dir
         if release_dir:
-            release_binary = os.path.join(release_dir, "llama-omni-server")
+            release_binary = os.path.join(release_dir, "llama-omni-server" + (".exe" if is_win else ""))
             if not os.path.isfile(release_binary) or not os.access(release_binary, os.X_OK):
                 raise RuntimeError(f"Selected native release is not executable: {release_binary}")
             return release_binary
-        is_win = platform.system() == "Windows"
         candidates = []
         if is_win:
             candidates += [
+                os.path.join(self.llamacpp_root, "build-cuda", "bin", "llama-omni-server.exe"),
+                os.path.join(self.llamacpp_root, "build", "bin", "Release", "llama-omni-server.exe"),
+                os.path.join(self.llamacpp_root, "build", "bin", "llama-omni-server.exe"),
                 os.path.join(self.llamacpp_root, "build", "bin", "Release", "llama-server.exe"),
                 os.path.join(self.llamacpp_root, "build", "bin", "llama-server.exe"),
             ]
@@ -1110,9 +1189,9 @@ class CppBackendWorker:
             "duplex_mode": duplex_mode,
             "model_dir": self.model_dir,
             "tts_bin_dir": tts_bin_dir,
-            "tts_gpu_layers": 100,
-            "token2wav_device": "gpu:0",
-            "vision_backend": os.environ.get("OMNI_VISION_BACKEND", "metal"),
+            "tts_gpu_layers": int(os.environ.get("OMNI_TTS_GPU_LAYERS", self.runtime_env.get("OMNI_TTS_GPU_LAYERS", "100"))),
+            "token2wav_device": os.environ.get("OMNI_T2W_DEVICE", self.runtime_env.get("OMNI_T2W_DEVICE", "gpu:0")),
+            "vision_backend": os.environ.get("OMNI_VISION_BACKEND", self.runtime_env.get("OMNI_VISION_BACKEND", "metal")),
             "output_dir": self._output_dir,
         }
 

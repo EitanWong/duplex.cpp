@@ -55,7 +55,7 @@ struct llama_context {
     //   - etc.
     void sched_reserve();
 
-    void synchronize();
+    void synchronize(const char * reason = "internal");
 
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;

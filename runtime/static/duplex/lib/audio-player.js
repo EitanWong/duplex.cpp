@@ -64,6 +64,9 @@ export class AudioPlayer {
          * (samples: Float32Array, sampleRate: number, playbackTimestamp: number) => void
          */
         this.onRawAudio = null;
+        // Optional diagnostic/recording sink; ordinary playback uses destination.
+        this.outputNode = null;
+        this.onSchedule = null;
     }
 
     // Public read-only accessors
@@ -157,12 +160,13 @@ export class AudioPlayer {
             const baseDelayMs = this._getDelayMs();
             // Native packets represent 25 acoustic steps at 25 Hz. The first
             // crossfaded packet can be shorter; cover that known duration
-            // deficit plus observed jitter, with a strict 350 ms startup cap.
+            // deficit plus observed jitter. This reserve is the total startup
+            // cushion; the configured delay already contributes to it.
             const durationMs = resampled.length / this._outputSR * 1000;
             const reserveMs = Math.max(this._adaptiveReserveMs,
                 Math.min(250, Math.max(0, 1040-durationMs)+50));
             const delayMs = baseDelayMs <= 0 ? 0 :
-                Math.min(Math.max(baseDelayMs, 350), baseDelayMs+reserveMs);
+                Math.max(baseDelayMs, reserveMs);
             if (!this._delayTimer) {
                 if (delayMs <= 0) {
                     this._startPlayback();
@@ -193,6 +197,7 @@ export class AudioPlayer {
         }
         this._turnActive = false;
         this._stopAheadMonitor();
+        this._emitMetrics();
         const ahead = this._playing
             ? ((this._nextTime - this._ctx.currentTime) * 1000).toFixed(0)
             : '0';
@@ -225,12 +230,15 @@ export class AudioPlayer {
         buffer.getChannelData(0).set(samples);
         const source = this._ctx.createBufferSource();
         source.buffer = buffer;
-        source.connect(this._ctx.destination);
+        source.connect(this.outputNode || this._ctx.destination);
 
         const now = this._ctx.currentTime;
         if (this._nextTime < now) {
             const gapMs = (now - this._nextTime) * 1000;
-            if (this._playbackStartTime && this._turnActive && gapMs > 10) {
+            // Creating the first buffer can cross a render quantum before any
+            // audio has been scheduled. That is startup delay, not starvation.
+            if (this._nextTime > this._playbackStartCtxTime &&
+                this._playbackStartTime && this._turnActive && gapMs > 10) {
                 this._adaptiveReserveMs = Math.min(250, Math.max(this._adaptiveReserveMs, gapMs+40));
                 this._underflowTotalMs += gapMs;
                 this._underflowLongestMs = Math.max(this._underflowLongestMs, gapMs);
@@ -258,11 +266,24 @@ export class AudioPlayer {
             this.onRawAudio(rawSamples, this._outputSR_expected, playbackMs);
         }
 
-        source.start(this._nextTime);
+        const scheduledTime = this._nextTime;
+        source.start(scheduledTime);
         this._nextTime += buffer.duration;
+        if (this.onSchedule) {
+            const stamp = this._ctx.getOutputTimestamp?.();
+            this.onSchedule({ turn: this._turnIdx, chunk: this._enqueueCount,
+                samples: samples.length, sampleRate: this._outputSR,
+                scheduledAudioTime: scheduledTime, durationMs: buffer.duration * 1000,
+                contextTime: now, contextState: this._ctx.state,
+                outputContextTime: stamp?.contextTime ?? null,
+                outputPerformanceTime: stamp?.performanceTime ?? null,
+                baseLatencyMs: (this._ctx.baseLatency || 0) * 1000,
+                outputLatencyMs: (this._ctx.outputLatency || 0) * 1000 });
+        }
 
         this._sources.push(source);
         source.onended = () => {
+            source.disconnect();
             const idx = this._sources.indexOf(source);
             if (idx >= 0) this._sources.splice(idx, 1);
             if (!this._turnActive && this._sources.length === 0) {

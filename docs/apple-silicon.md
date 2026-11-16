@@ -21,7 +21,7 @@ selected baseline settings.
 
 The original development workspace, model files, release binaries and experiment
 evidence remain local. This repository carries source and profiles; rebuild native
-artifacts with `scripts/build-release.sh`.
+artifacts with `scripts/macos/build.sh`.
 
 ## Acceptance boundary
 

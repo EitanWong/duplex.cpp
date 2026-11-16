@@ -22,6 +22,7 @@
 struct vision_ctx;
 struct audition_ctx;
 struct audition_audio_f32;
+struct tts_cuda_head;
 
 // Forward declaration for C++ Token2Wav
 namespace omni {
@@ -75,6 +76,8 @@ struct LLMThreadInfo {
     std::queue<omni_embeds*> queue;
     std::mutex mtx;
     std::condition_variable cv;
+    std::condition_variable decode_cv;
+    bool prefill_done = false; // protected by mtx, scoped to this context
     std::chrono::steady_clock::time_point start;
     std::chrono::steady_clock::time_point end;
 
@@ -171,6 +174,7 @@ using audio_output_cb_t = std::function<void(const float * samples, int n_sample
 
 struct omni_context {
     struct vision_ctx * ctx_vision = NULL;
+    std::chrono::steady_clock::time_point idle_since = std::chrono::steady_clock::now();
     struct audition_ctx * ctx_audio = NULL;
     
     struct llama_context * ctx_llama = NULL;
@@ -181,6 +185,10 @@ struct omni_context {
     // true: omni_init 内部加载的模型，omni_free 时需要释放
     // false: 外部传入的已有模型（模型复用），omni_free 时不释放
     bool owns_model = true;
+
+    // Exact token prefix of the last plain-text input, in resident LLM KV.
+    // Generation tokens are never treated as a verified input prefix.
+    std::vector<llama_token> text_prompt_cache;
 
     // 🔧 [Length Penalty] 用于调整 EOS token 的采样概率
     // length_penalty > 1.0 会降低 EOS 概率，让模型生成更长的输出
@@ -202,6 +210,22 @@ struct omni_context {
     struct omni_output *omni_output = NULL;
     int n_past = 0;
     int n_keep = 0;
+
+    // Published by the sole LLM thread; consumers must not inspect live cell
+    // metadata from the WebSocket/TTS threads.
+    std::atomic<int> kv_used{0}, kv_physical_span{0}, kv_attention_span{0}, kv_capacity{0};
+    std::atomic<uint64_t> kv_allocated_bytes{0};
+    std::atomic<int> kv_evictions{0}, kv_evicted_tokens{0}, kv_unit_fallbacks{0};
+    std::atomic<double> kv_prune_ms{0.0};
+    std::atomic<double> input_queue_ms{0.0}, llm_queue_ms{0.0}, input_age_ms{0.0};
+    std::atomic<int> kv_accounted_tokens{0};
+    std::atomic<int> kv_completed_turn{0};
+    bool kv_input_failed = false;
+    std::mutex memory_mutex;
+    std::string memory_pending_text, memory_last_text;
+    int memory_last_unit_id = -1;
+    std::atomic<int> memory_injections{0}, memory_tokens{0};
+    std::atomic<double> memory_prefill_ms{0.0}, memory_retrieval_ms{0.0};
     
     // ==================== 轮次边界管理（用于智能滑动窗口） ====================
     // 每轮对话开始时的 n_past 位置
@@ -408,6 +432,10 @@ struct omni_context {
     // head_code: Linear layer (hidden_size=768 -> num_audio_tokens=6562)
     // Note: num_vq=1, so we only need one head_code layer
     float * head_code_weight = nullptr;  // (768, 6562) - stored as (hidden_size, num_audio_tokens)
+    std::vector<float> head_code_cpu_packed; // optional exact-order AVX2 CPU projection
+    bool head_code_cpu_interleaved = false;
+    struct tts_cuda_head * head_code_cuda = nullptr;
+    bool head_code_cuda_attempted = false;
     int head_code_hidden_size = 0;  // 768
     int head_code_num_audio_tokens = 0;  // 6562
     
@@ -522,6 +550,10 @@ void omni_free(struct omni_context * ctx_omni);
 // new session, without tearing down the loaded model (unlike omni_free).
 void omni_prepare_for_reuse(struct omni_context * ctx_omni);
 
+// Caller holds the context lifecycle lock and has excluded active sessions.
+// Releases only CUDA lazy vision, after all inference threads have been joined.
+bool omni_release_idle_vision(struct omni_context * ctx_omni, int idle_seconds);
+
 // ANE/CoreML warmup — call once after omni_init to pre-load models into NPU
 void omni_warmup_ane(struct omni_context * ctx_omni);
 
@@ -625,6 +657,10 @@ void omni_notify_audio_interrupt(struct omni_context * ctx_omni);
 bool stop_speek(struct omni_context * ctx_omni);
 
 bool clean_kvcache(struct omni_context * ctx_omni);
+
+// Synchronous text-only prefill with exact-prefix reuse. Caller stops inference
+// threads and clears this prefix before any multimodal or duplex input.
+bool omni_prefill_text_cached(struct omni_context * ctx_omni, const std::string & text, int & reused_tokens);
 
 // TTS 推理函数声明（用于 test_tts_inference.cpp）
 bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts_model_path);

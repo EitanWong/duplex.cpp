@@ -691,6 +691,8 @@ async def lifespan(app: FastAPI):
             cpp_server_port=config.get("cpp_server_port"),
             ctx_size=config.get("ctx_size", 32768),
             n_gpu_layers=config.get("n_gpu_layers", 99),
+            native_binary_dir=config.get("native_binary_dir", ""),
+            runtime_env=config.get("runtime_env", {}),
         )
     else:
         worker = MiniCPMOWorker(
@@ -1027,6 +1029,8 @@ def _build_cpp_sampling(cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             out[key] = val
     if cfg.get("decode_mode") == "greedy":
         out["temperature"] = 0.0
+    if "generate_audio" in cfg:
+        out["use_tts"] = bool(cfg["generate_audio"])
     return out
 
 
@@ -1125,6 +1129,8 @@ async def chat_ws(ws: WebSocket):
 
         chat_ws_recorder: Optional[TurnBasedSessionRecorder] = None
         chat_ws_session_id: Optional[str] = None
+        gen_task = None
+        disconnect_task = None
 
         try:
             # 1. 解析消息和参数
@@ -1219,9 +1225,18 @@ async def chat_ws(ws: WebSocket):
                     ref_audio_path=session_ref_audio_path,
                     system_content=_sys_content_items or None,
                     sampling=chat_sampling or None,
+                    **({'native_messages': raw_messages} if worker.processor is None else {}),
                 )
 
             await asyncio.to_thread(_do_prefill)
+            if worker.processor is None:
+                async def watch_native_disconnect():
+                    while True:
+                        incoming = await ws.receive()
+                        if incoming['type'] == 'websocket.disconnect':
+                            await asyncio.to_thread(worker.cancel_native_chat)
+                            return
+                disconnect_task = asyncio.create_task(watch_native_disconnect())
             pre_kv = worker.processor.kv_cache_length if worker.processor else getattr(worker, "kv_cache_length", 0)
             await ws.send_json({"type": "prefill_done", "input_tokens": pre_kv})
 
@@ -1376,7 +1391,8 @@ async def chat_ws(ws: WebSocket):
                         length_penalty=length_penalty,
                     )
 
-                result = await asyncio.to_thread(_run_non_streaming)
+                gen_task = asyncio.create_task(asyncio.to_thread(_run_non_streaming))
+                result = await asyncio.shield(gen_task)
 
                 text = result
                 audio_data = None
@@ -1421,6 +1437,15 @@ async def chat_ws(ws: WebSocket):
             except Exception:
                 pass
         finally:
+            if disconnect_task is not None:
+                if not disconnect_task.done():
+                    disconnect_task.cancel()
+                await asyncio.gather(disconnect_task, return_exceptions=True)
+            if worker.processor is None:
+                await asyncio.to_thread(worker.cancel_native_chat)
+                if gen_task is not None and not gen_task.done():
+                    await asyncio.wait_for(asyncio.shield(gen_task), timeout=30)
+                worker._native_chat_request = None
             if chat_ws_recorder:
                 try:
                     chat_ws_recorder.finalize()
@@ -2154,6 +2179,7 @@ async def duplex_ws(ws: WebSocket):
     chunk_idx: int = 0
     session_start_perf: float = time.perf_counter()
     duplex_prepared: bool = False
+    duplex_prepare_started: bool = False
     use_deferred_finalize: bool = True
 
     # 保留完整连续输入；队列深度由下方统计任务监测，不静默丢弃历史块。
@@ -2408,6 +2434,7 @@ async def duplex_ws(ws: WebSocket):
             msg_type = msg.get("type", "")
 
             if msg_type == "prepare":
+                duplex_prepare_started = True
                 system_prompt = msg.get("system_prompt", "You are a helpful assistant.")
                 ref_audio_path = msg.get("ref_audio_path")
                 ref_audio_b64 = msg.get("ref_audio_base64")
@@ -2483,7 +2510,8 @@ async def duplex_ws(ws: WebSocket):
                 _client_ref_provided = bool(ref_audio_b64 or ref_audio_path)
                 if not _client_ref_provided and os.path.isfile(_duplex_ref_by_lang):
                     actual_ref_audio_path = _duplex_ref_by_lang
-                    actual_tts_audio_path = _duplex_ref_by_lang
+                    if not actual_tts_audio_path:
+                        actual_tts_audio_path = _duplex_ref_by_lang
 
                 _has_tts_field_d = bool(msg.get("tts_ref_audio_base64"))
                 _tts_same_as_llm = (tts_ref_audio_b64 == ref_audio_b64) if tts_ref_audio_b64 else True
@@ -2711,7 +2739,8 @@ async def duplex_ws(ws: WebSocket):
                 # Stop 后立即进入非活跃（LOADING）状态，避免新会话被过早接入
                 worker.state.status = WorkerStatus.LOADING
                 worker.state.duplex_pause_time = None
-                worker.duplex_stop()
+                if duplex_prepare_started:
+                    worker.duplex_stop()
                 await ws.send_json({"type": "stopped"})
                 break
 
@@ -2754,17 +2783,21 @@ async def duplex_ws(ws: WebSocket):
             except Exception:
                 audio_chunk_worker_task.cancel()
 
-        try:
-            worker.duplex_stop()
-        except Exception:
-            pass
+        if duplex_prepare_started:
+            try:
+                worker.duplex_stop()
+            except Exception:
+                pass
 
         worker.state.status = WorkerStatus.LOADING
         try:
-            if hasattr(worker, 'full_reinit'):
-                await asyncio.to_thread(worker.full_reinit)
-            else:
-                await asyncio.to_thread(worker.duplex_cleanup)
+            # A connection closed before prepare never touched model state.
+            # Failed preparation still needs the full cleanup path.
+            if duplex_prepare_started:
+                if hasattr(worker, 'full_reinit'):
+                    await asyncio.to_thread(worker.full_reinit)
+                else:
+                    await asyncio.to_thread(worker.duplex_cleanup)
             worker.state.status = WorkerStatus.IDLE
         except Exception as e:
             logger.error(f"Duplex reinit failed: {e}", exc_info=True)
@@ -2834,6 +2867,8 @@ def main():
             "cpp_server_port": cpp_cfg.cpp_server_port,
             "ctx_size": cpp_cfg.ctx_size,
             "n_gpu_layers": cpp_cfg.n_gpu_layers,
+            "native_binary_dir": cpp_cfg.native_binary_dir,
+            "runtime_env": cpp_cfg.runtime_env,
         })
         logger.info(f"Starting Worker (C++ backend) on port {port}, GPU {gpu_id}")
     else:

@@ -28,6 +28,11 @@
 #ifdef _WIN32
 #include <fcntl.h>
 #include <io.h>
+// MSVC has no POSIX iovec; the Windows reader below handles one span at a time.
+struct iovec {
+    void * iov_base;
+    size_t iov_len;
+};
 #else
 #include <fcntl.h>
 #include <sys/uio.h>
@@ -1419,7 +1424,8 @@ struct llama_moe_slot_runtime::impl {
             if (_lseeki64(fd, (int64_t) (offset + done), SEEK_SET) < 0) {
                 throw std::runtime_error("failed to seek MoE experts");
             }
-            const ssize_t result = _read(fd, cur[0].iov_base, (unsigned int) cur[0].iov_len);
+            const int result = _read(fd, cur[0].iov_base,
+                                      (unsigned int) std::min<size_t>(cur[0].iov_len, INT_MAX));
 #else
             const ssize_t result = preadv(fd, cur, cn, (off_t) (offset + done));
 #endif

@@ -154,6 +154,8 @@ public:
     uint32_t get_size()     const;
     uint32_t get_n_stream() const;
 
+    llama_kv_cache_stats get_stats() const;
+
     bool get_has_shift() const;
 
     ggml_type type_k() const;

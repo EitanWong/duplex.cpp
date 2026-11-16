@@ -10,7 +10,6 @@ import threading
 import time
 
 import numpy as np
-import soundfile as sf
 from websockets.sync.client import connect
 
 
@@ -18,9 +17,13 @@ logger = logging.getLogger('cpp_backend')
 
 
 class NativeDuplex:
-    def __init__(self, owner, prompt, ref_audio_path, sampling, length_penalty):
+    def __init__(self, owner, prompt, ref_audio_path, sampling, length_penalty,
+                 tts_ref_audio_path=None):
         self.owner = owner
         self.results = queue.Queue()
+        self.memory_results = queue.Queue()
+        self.memory_request_lock = threading.Lock()
+        self.memory_query = ''
         self.audio = queue.Queue()
         self.audio_lock = threading.Lock()
         self.audio_ready = threading.Event()
@@ -37,10 +40,7 @@ class NativeDuplex:
         self.assistant_spoke = False
         self.speech_gate = _ForegroundSpeech()
         self.pending_speech_hint = None
-        self.ws = connect(owner._cpp_server_url.replace('http://', 'ws://')+'/backend',
-                          proxy=None, max_size=20*1024*1024, open_timeout=30,
-                          ping_interval=None, close_timeout=5)
-        payload = {'mode': 'full_duplex', 'use_tts': True,
+        payload = {'mode': 'full_duplex', 'use_tts': (sampling or {}).get('use_tts', True),
                    'system_prompt': prompt or 'Streaming Duplex Conversation.',
                    'config': {**(sampling or {}), 'length_penalty': length_penalty}}
         # Bound the native per-second speak budget so long answers keep accepting input.
@@ -49,13 +49,18 @@ class NativeDuplex:
             budget, int(payload['config'].get('max_new_speak_tokens_per_chunk', budget)))
         ref = ref_audio_path or owner.ref_audio_path
         if ref:
-            wave, sr = sf.read(ref, dtype='float32')
-            if wave.ndim > 1:
-                wave = wave.mean(axis=1)
-            if sr != 16000:
-                raise ValueError('Reference audio must be mono 16 kHz')
+            from core.audio import load_mono_audio
+            wave = load_mono_audio(ref)
             encoded = base64.b64encode(wave.astype(np.float32).tobytes()).decode()
             payload['voice'] = {'ref_audio': encoded, 'tts_ref_audio': encoded}
+        if tts_ref_audio_path and tts_ref_audio_path != ref:
+            from core.audio import load_mono_audio
+            tts_wave = load_mono_audio(tts_ref_audio_path)
+            tts_encoded = base64.b64encode(tts_wave.astype(np.float32).tobytes()).decode()
+            payload.setdefault('voice', {})['tts_ref_audio'] = tts_encoded
+        self.ws = connect(owner._cpp_server_url.replace('http://', 'ws://')+'/backend',
+                          proxy=None, max_size=20*1024*1024, open_timeout=30,
+                          ping_interval=None, close_timeout=5)
         self.ws.send(json.dumps({'type': 'session.init', 'payload': payload}))
         created = json.loads(self.ws.recv(timeout=120))
         if created.get('type') != 'session.created':
@@ -67,6 +72,7 @@ class NativeDuplex:
         self.reader.start()
 
     def _read(self):
+        text_parts = []
         try:
             for raw in self.ws:
                 event = json.loads(raw)
@@ -80,10 +86,17 @@ class NativeDuplex:
                                         'speech_end': event.get('speech_end', False)}
                             self.audio.put((producer_epoch, base64.b64decode(event.get('audio') or ''), metadata))
                             self.audio_ready.set()
+                elif event.get('kind') == 'text':
+                    text_parts.append(event.get('text', ''))
                 elif event.get('kind') == 'listen':
-                    self.results.put((True, '', metrics))
+                    # LISTEN can terminate a chunk that already produced text.
+                    self.results.put((True, event.get('text') or ''.join(text_parts), metrics))
+                    text_parts.clear()
                 elif event.get('type') == 'response.done':
-                    self.results.put((False, event.get('text', ''), metrics))
+                    self.results.put((False, event.get('text') or ''.join(text_parts), metrics))
+                    text_parts.clear()
+                elif event.get('type') in ('memory.updated', 'memory.error'):
+                    self.memory_results.put(event)
                 elif event.get('type') == 'session.closed':
                     if not self.closed:
                         self.results.put(RuntimeError(f'Native session closed: {event}'))
@@ -123,6 +136,8 @@ class NativeDuplex:
             self.forced_listen_active = forced
             request_epoch = self.audio_epoch
         self.pending['force_listen'] = forced
+        if getattr(self, 'memory_query', ''):
+            self.pending['memory_query'] = self.memory_query
         logger.info('[AfterSpeak] %s', json.dumps({
             'chunk': self.owner._duplex_chunk_counter,
             'assistant_spoke': self.assistant_spoke,
@@ -142,16 +157,34 @@ class NativeDuplex:
         listen, text, metrics = item
         self.last_native_metrics = metrics
         self.last_result_audio_epoch = request_epoch
-        if not listen and text:
-            self.assistant_spoke = True
-        elif listen and not automatic_listen and not force_listen:
-            # A natural LISTEN ends our intervention. The next user turn starts
-            # with the model's own decision until it actually speaks again.
+        if listen:
+            # The interrupted speech has stopped, including for a forced LISTEN.
+            # Let the model decide on subsequent input until it speaks again.
             self.assistant_spoke = False
+        elif text:
+            self.assistant_spoke = True
         return DuplexGenerateResult(is_listen=listen, text=text, audio_data=None,
                                     end_of_turn=listen, current_time=self.owner._duplex_chunk_counter,
                                     cost_all_ms=(time.perf_counter()-start)*1000,
                                     cost_llm_ms=metrics.get('generate_ms', 0))
+
+    def update_memory(self, facts, query=''):
+        """Submit caller-supplied user quotations between completed input steps.
+
+        The server validates provenance/turns and queues bounded injection on its
+        LLM thread. No assistant reply is used as a user speech transcript.
+        """
+        if not isinstance(query, str) or len(query.encode('utf-8')) > 2048:
+            raise ValueError('Memory query must be at most 2048 UTF-8 bytes')
+        with self.memory_request_lock:
+            if self.closed:
+                raise RuntimeError('Native duplex session is closed')
+            self.ws.send(json.dumps({'type': 'memory.update', 'facts': facts}))
+            event = self.memory_results.get(timeout=20)
+            if event.get('type') != 'memory.updated':
+                raise RuntimeError(event.get('error', 'Native memory update failed'))
+            self.memory_query = query
+            return event
 
     def request_interrupt(self):
         """Mute now; commit LISTEN with the next intact native input unit."""

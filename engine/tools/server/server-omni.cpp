@@ -10,12 +10,14 @@
 #include "session.h"
 #include "ws_handler.h"
 
+#include <algorithm>
 #include <mutex>
 #include <thread>
 #include <queue>
 #include <condition_variable>
 #include <fstream>
 #include <string>
+#include <cstdlib>
 
 #include "httplib.h"
 #include <nlohmann/json.hpp>
@@ -93,6 +95,13 @@ int main(int argc, char ** argv) {
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SERVER)) {
         return 1;
+    }
+
+    // Core INFO callbacks use the trace verbosity level. Keep optional KV
+    // timing visible alongside application eviction events when requested.
+    const char * kv_trace = std::getenv("OMNI_KV_TRACE");
+    if (kv_trace && std::string(kv_trace) == "1") {
+        common_log_set_verbosity_thold(std::max(common_log_get_verbosity_thold(), LOG_LEVEL_TRACE));
     }
 
     // omni HTTP server is single-session (1:1 duplex), so 1 sequence is enough.
@@ -293,9 +302,10 @@ int main(int argc, char ** argv) {
             return;
         }
 
-        // SSE streaming
+        // The provider runs after this request handler returns. Own the request
+        // values it needs rather than retaining references to stack locals.
         res.set_chunked_content_provider("text/event-stream",
-            [&](size_t, httplib::DataSink & sink) -> bool {
+            [&, debug_dir, round_idx](size_t, httplib::DataSink & sink) -> bool {
                 // reset state
                 {
                     std::lock_guard<std::mutex> lock(state.octx->text_mtx);
@@ -418,8 +428,34 @@ int main(int argc, char ** argv) {
         res_ok(res, resp);
     });
 
-    // start server
-    if (!svr.listen(params.hostname, params.port)) {
+    // The lifecycle lock plus joined-thread checks exclude both active backend
+    // sessions and legacy inference. A new image uses the existing lazy loader.
+    std::atomic<bool> vision_idle_running{false};
+    std::thread vision_idle_thread;
+#if defined(GGML_USE_CUDA) && !defined(__APPLE__)
+    if (const char * value = std::getenv("OMNI_VISION_IDLE_SECONDS")) {
+        char * end = nullptr;
+        const long seconds = std::strtol(value, &end, 10);
+        if (end != value && *end == '\0' && seconds > 0 && seconds <= 86400) {
+            vision_idle_running = true;
+            vision_idle_thread = std::thread([&, seconds] {
+                while (vision_idle_running.load()) {
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                    std::unique_lock<std::mutex> lock(state.octx_mutex, std::try_to_lock);
+                    if (lock.owns_lock() && !state.session_mgr.has_active()) {
+                        omni_release_idle_vision(state.octx, (int) seconds);
+                    }
+                }
+            });
+        }
+    }
+#endif
+
+    // start server; join the idle observer before freeing its shared state.
+    const bool listened = svr.listen(params.hostname, params.port);
+    vision_idle_running = false;
+    if (vision_idle_thread.joinable()) vision_idle_thread.join();
+    if (!listened) {
         LOG_ERR("Failed to listen on %s:%d\n", params.hostname.c_str(), params.port);
         return 1;
     }

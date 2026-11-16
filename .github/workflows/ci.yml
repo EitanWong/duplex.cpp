@@ -20,6 +20,22 @@ jobs:
         with:
           python-version: '3.11'
       - run: python scripts/check-repository.py
+      - name: Check macOS shell syntax
+        shell: bash
+        run: |
+          for script in scripts/macos/*.sh scripts/macos/*.command; do
+            bash -n "$script" || exit
+          done
+      - name: Check Windows PowerShell syntax
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Get-ChildItem scripts/windows -Filter '*.ps1' | ForEach-Object {
+            $tokens = $null
+            $parseErrors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$parseErrors) | Out-Null
+            if ($parseErrors) { throw ($parseErrors | Out-String) }
+          }
       - run: python -m pip install pydantic numpy pytest pytest-asyncio
       - run: python -m pytest tests/test_schemas.py -q
         working-directory: runtime

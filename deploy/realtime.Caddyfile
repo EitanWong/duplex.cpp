@@ -1,0 +1,15 @@
+# Replace voice.example.com with your public DNS name. Point its A/AAAA records
+# to the proxy, and forward TCP 80/443 to Caddy. Caddy provisions public TLS.
+# Run runtime/realtime.py --host 127.0.0.1 --port 8006 --http on the SAME host.
+# This file publishes only the isolated authenticated API, never the demo Gateway.
+voice.example.com {
+    @realtime path /v1/realtime /v1/realtime/* /v1/models
+    handle @realtime {
+        reverse_proxy 127.0.0.1:8006 {
+            stream_timeout 30m
+        }
+    }
+    handle {
+        respond "Not found" 404
+    }
+}
