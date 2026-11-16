@@ -90,3 +90,33 @@ def test_new_assistant_speech_rearms_automatic_interruption():
     _, sent = generate_result(native, True)
     assert sent['force_listen']
     assert native.audio_epoch == 2
+
+
+def test_memory_acknowledgements_do_not_become_listen_or_speak_results():
+    native = NativeDuplex.__new__(NativeDuplex)
+    native.owner = SimpleNamespace(_maybe_update_kv_cache_length=Mock())
+    native.closed = False
+    native.results = queue.Queue()
+    native.memory_results = queue.Queue()
+    native.ws = [json.dumps(event) for event in [
+        {'type': 'memory.error', 'error': 'source turn is not completed'},
+        {'type': 'memory.updated', 'revision': 1},
+        {'kind': 'listen'},
+    ]]
+    native._read()
+    assert native.memory_results.get_nowait()['type'] == 'memory.error'
+    assert native.memory_results.get_nowait()['revision'] == 1
+    assert native.results.get_nowait() == (True, '', {})
+    assert native.results.empty()
+
+
+def test_rejected_memory_update_retains_the_previous_retrieval_query():
+    native = generating_native()
+    native.closed = False
+    native.memory_request_lock = threading.Lock()
+    native.memory_results = queue.Queue()
+    native.memory_query = 'previous'
+    native.memory_results.put({'type': 'memory.error', 'error': 'assistant is not a user source'})
+    with pytest.raises(RuntimeError, match='not a user source'):
+        native.update_memory([{'source': 'assistant'}], 'new query')
+    assert native.memory_query == 'previous'

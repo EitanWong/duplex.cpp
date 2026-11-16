@@ -789,6 +789,18 @@ extern "C" {
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
+    // Metadata only; no device synchronization or tensor download. Currently
+    // supported for a plain KV cache. False means unsupported, not an empty KV.
+    // Call on the context's inference thread. Counts cover all cache streams.
+    struct llama_kv_cache_stats {
+        uint32_t used_cells;
+        uint32_t physical_span;
+        uint32_t attention_span;
+        uint32_t capacity_cells;
+        uint64_t allocated_bytes;
+    };
+    LLAMA_API bool llama_memory_get_kv_stats(llama_memory_t mem, struct llama_kv_cache_stats * stats);
+
     //
     // State / sessions
     //

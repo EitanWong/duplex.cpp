@@ -10,6 +10,7 @@
 #include "session.h"
 #include "ws_handler.h"
 
+#include <algorithm>
 #include <mutex>
 #include <thread>
 #include <queue>
@@ -94,6 +95,13 @@ int main(int argc, char ** argv) {
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SERVER)) {
         return 1;
+    }
+
+    // Core INFO callbacks use the trace verbosity level. Keep optional KV
+    // timing visible alongside application eviction events when requested.
+    const char * kv_trace = std::getenv("OMNI_KV_TRACE");
+    if (kv_trace && std::string(kv_trace) == "1") {
+        common_log_set_verbosity_thold(std::max(common_log_get_verbosity_thold(), LOG_LEVEL_TRACE));
     }
 
     // omni HTTP server is single-session (1:1 duplex), so 1 sequence is enough.

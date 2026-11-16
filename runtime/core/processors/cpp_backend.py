@@ -325,7 +325,8 @@ class CppBackendWorker:
         if previous:
             previous.close()
         self._native_duplex = NativeDuplex(
-            self, system_prompt_text, ref_audio_path, sampling, length_penalty
+            self, system_prompt_text, ref_audio_path, sampling, length_penalty,
+            tts_ref_audio_path=prompt_wav_path,
         )
         self._native_duplex_used = True
         self._native_duplex_reusable = False
@@ -380,6 +381,13 @@ class CppBackendWorker:
 
         self._cleanup_temp_files(temp_audio, temp_image)
         return {"n_vision_images": n_vision_images}
+
+    def duplex_update_memory(self, facts, query=''):
+        """Experimental typed-user/external-transcript facts; call between steps."""
+        native = getattr(self, '_native_duplex', None)
+        if native is None:
+            raise RuntimeError('An active native duplex session is required')
+        return native.update_memory(facts, query)
 
     def duplex_generate(self, force_listen: bool = False) -> "DuplexGenerateResult":
         """Duplex 生成 → /v1/stream/decode + scan WAV files"""

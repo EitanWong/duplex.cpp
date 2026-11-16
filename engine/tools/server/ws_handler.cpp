@@ -16,6 +16,7 @@
 #include <type_traits>
 #include "session.h"
 #include "protocol.h"
+#include "fact-memory.h"
 #include "token2wav/token2wav.h"
 #include "omni.h"
 #include "common.h"
@@ -117,6 +118,26 @@ static ProtocolMetrics make_runtime_metrics(omni_context * octx,
     metrics.backend = "llama.cpp-omni";
     if (octx) {
         metrics.kv_cache_length = std::max(0, octx->n_past);
+        if (octx->kv_capacity.load() > 0) {
+            metrics.kv = {{"used_cells", octx->kv_used.load()},
+                {"physical_span", octx->kv_physical_span.load()},
+                {"attention_span", octx->kv_attention_span.load()},
+                {"capacity_cells", octx->kv_capacity.load()},
+                {"allocated_bytes", octx->kv_allocated_bytes.load()},
+                {"evictions", octx->kv_evictions.load()},
+                {"evicted_tokens", octx->kv_evicted_tokens.load()},
+                {"unit_fallbacks", octx->kv_unit_fallbacks.load()},
+                {"prune_metadata_ms", octx->kv_prune_ms.load()},
+                {"completed_turns", octx->kv_completed_turn.load()},
+                {"memory_injections", octx->memory_injections.load()},
+                {"memory_tokens", octx->memory_tokens.load()},
+                {"memory_prefill_ms", octx->memory_prefill_ms.load()},
+                {"memory_retrieval_ms", octx->memory_retrieval_ms.load()},
+                {"accounted_tokens", octx->kv_accounted_tokens.load()},
+                {"input_queue_ms", octx->input_queue_ms.load()},
+                {"llm_queue_ms", octx->llm_queue_ms.load()},
+                {"input_age_ms", octx->input_age_ms.load()}};
+        }
         metrics.n_tts_tokens = (int)octx->tts_all_generated_tokens.size();
         if (vision_slices > 0 && octx->ctx_vision) {
             metrics.vision_tokens = vision_slices * vision_n_output_tokens(octx->ctx_vision);
@@ -832,6 +853,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
     // ================================================================
     std::string raw;
     int response_seq = 0;
+    omni_fact_memory fact_memory;
 
     while (true) {
         read_result = ws.read(raw);
@@ -853,6 +875,20 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             msg_type = msg.at("type").get<std::string>();
         }
 
+        if (msg_type == "memory.update") {
+            if (parsed_init.mode != "full_duplex" || !runtime_option_enabled("OMNI_TEXT_MEMORY") ||
+                octx->sliding_window_config.mode != "turn") {
+                send_event({{"type", "memory.error"}, {"error", "text memory requires full_duplex, OMNI_TEXT_MEMORY=1 and OMNI_DUPLEX_WINDOW=turn"}});
+                continue;
+            }
+            try {
+                fact_memory.update(msg.at("facts"), octx->kv_completed_turn.load());
+                send_event({{"type", "memory.updated"}, {"revision", fact_memory.revision()}, {"facts", fact_memory.size()}});
+            } catch (const std::exception & error) {
+                send_event({{"type", "memory.error"}, {"error", error.what()}});
+            }
+            continue;
+        }
         if (msg_type != "input.append") {
             // Unknown or invalid type after init → fail-fast
             LOG_ERR("WS /backend: unexpected message type '%s' from session %s\n",
@@ -1197,6 +1233,20 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                 return;
             }
 
+            if (runtime_option_enabled("OMNI_TEXT_MEMORY") && octx->sliding_window_config.mode == "turn") {
+                const auto & input = msg.at("input");
+                if (input.contains("memory_query") && (!input["memory_query"].is_string() || input["memory_query"].get<std::string>().size() > 2048)) {
+                    fail_fast(session_id, "invalid_memory_query");
+                    return;
+                }
+                const auto retrieval_started = std::chrono::steady_clock::now();
+                // Reserve the two unit delimiters inside the 512-token budget.
+                const auto selected = fact_memory.retrieve(input.value("memory_query", std::string()), 510,
+                    [&](const std::string & text) { return (int)common_tokenize(octx->ctx_llama, text, false, false).size(); });
+                octx->memory_retrieval_ms.store(octx->memory_retrieval_ms.load() + elapsed_ms(retrieval_started));
+                std::lock_guard<std::mutex> lock(octx->memory_mutex);
+                octx->memory_pending_text = selected;
+            }
             TempMediaFiles tmp_files;
             int input_index = ++msg_counter;
             octx->trace_input.store(input_index);
@@ -1255,8 +1305,9 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             }
 
             const auto t_generate_start = std::chrono::steady_clock::now();
-            std::thread decode_thread([octx, debug_dir]() {
-                stream_decode(octx, debug_dir, -1);
+            bool decode_ok = false;
+            std::thread decode_thread([octx, debug_dir, &decode_ok]() {
+                decode_ok = stream_decode(octx, debug_dir, -1);
             });
 
             // Collect full text for response.done
@@ -1318,6 +1369,10 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
 
             if (decode_thread.joinable()) {
                 decode_thread.join();
+            }
+            if (!decode_ok) {
+                fail_fast(session_id, "decode_failed");
+                return;
             }
             double generate_ms = elapsed_ms(t_generate_start);
             {

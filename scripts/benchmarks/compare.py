@@ -24,7 +24,10 @@ def describe(report):
         'kv_length_max': max((v for v in lengths if v is not None), default=None),
         'kv_length_drop_indices': drops,
         'kv_drop_latency_ms': distribution([frames[i]['latency_ms'] for i in drops]),
-        'first_speak_to_pcm_ms': report['first_speak_to_pcm_ms'], 'audio': report['audio'],
+        'init_ms': report.get('init_ms'), 'first_text_ms': report.get('first_text_ms'),
+        'first_speak_to_pcm_ms': report['first_speak_to_pcm_ms'],
+        'source_input_to_first_pcm_per_native_turn_ms': report.get('source_input_to_first_pcm_per_native_turn_ms'),
+        'audio': report['audio'],
     }
 
 
@@ -37,14 +40,20 @@ def main():
     baseline_manifest = json.loads((args.baseline / 'manifest.json').read_text(encoding='utf-8'))
     candidate_manifest = json.loads((args.candidate / 'manifest.json').read_text(encoding='utf-8'))
     keys = ('model_dir', 'ctx_size', 'audio_only', 'video_start_at', 'count', 'rounds', 'interval_ms',
-            'tail_seconds', 'interrupt_at', 'tts_temperature')
+            'tail_seconds', 'interrupt_at', 'interrupt_every', 'burst_size', 'recovery_count', 'tts_temperature', 'memory_fixture', 'memory_query')
+    baseline_manifest.setdefault('interrupt_every', 0); candidate_manifest.setdefault('interrupt_every', 0)
+    baseline_manifest.setdefault('burst_size', 1); candidate_manifest.setdefault('burst_size', 1)
+    baseline_manifest.setdefault('recovery_count', 0); candidate_manifest.setdefault('recovery_count', 0)
     manifest_differences = {key: [baseline_manifest.get(key), candidate_manifest.get(key)] for key in keys
                             if baseline_manifest.get(key) != candidate_manifest.get(key)}
     baseline_paths = {path.parent.name: path for path in args.baseline.glob('round-*/report.json')}
     candidate_paths = {path.parent.name: path for path in args.candidate.glob('round-*/report.json')}
     if not baseline_paths or baseline_paths.keys() != candidate_paths.keys():
         parser.error('Both runs must contain the same nonempty set of rounds')
-    results = {'manifest_differences': manifest_differences, 'rounds': [],
+    environment_differences = {key: [baseline_manifest.get('environment', {}).get(key), candidate_manifest.get('environment', {}).get(key)]
+        for key in sorted(set(baseline_manifest.get('environment', {})) | set(candidate_manifest.get('environment', {})))
+        if baseline_manifest.get('environment', {}).get(key) != candidate_manifest.get('environment', {}).get(key)}
+    results = {'manifest_differences': manifest_differences, 'environment_differences': environment_differences, 'rounds': [],
                'speech_quality_accepted': False,
                'note': 'Output changes can change the workload; latency ratios alone do not prove speedup.'}
     for name in sorted(baseline_paths):

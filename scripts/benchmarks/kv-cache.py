@@ -27,6 +27,8 @@ def main():
     parser.add_argument('--tokens', type=int, default=128)
     parser.add_argument('--repetitions', type=int, default=5)
     parser.add_argument('--mixed', action='store_true', help='Also test q8_0/f16 and f16/q8_0')
+    parser.add_argument('--formats', nargs='+', choices=('f16:f16', 'f16:q8_0', 'q8_0:f16', 'q8_0:q8_0'),
+                        help='Explicit K:V pairs for capacity experiments; overrides --mixed')
     args = parser.parse_args()
     if min(args.depths) < 0 or args.tokens < 1 or args.repetitions < 1:
         parser.error('Depths must be nonnegative; tokens and repetitions must be positive')
@@ -65,6 +67,10 @@ def main():
     pairs = [('f16', 'f16'), ('q8_0', 'q8_0')]
     if args.mixed:
         pairs += [('q8_0', 'f16'), ('f16', 'q8_0')]
+    if args.formats:
+        pairs = [tuple(value.split(':')) for value in args.formats]
+    manifest['formats'] = pairs
+    (args.output / 'manifest.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
     results = []
     for key_type, value_type in pairs:
         command = [str(binary), '-m', str(args.model.resolve()), '-p', '0', '-n', str(args.tokens),

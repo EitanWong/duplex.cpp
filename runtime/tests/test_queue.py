@@ -409,7 +409,9 @@ class TestStreamingLRU:
         assert f.result() == w0
 
         # 模拟 gateway 刷新时间并释放 Worker
-        w0.last_cache_used_at = datetime.now()
+        # Windows wall-clock resolution can give consecutive now() calls the
+        # same value. Establish the ordering this LRU test actually requires.
+        w0.last_cache_used_at = w1.last_cache_used_at + timedelta(seconds=1)
         pool.release_worker(w0, duration_s=1.0)
 
         # 现在 w0 是最新的，如果有新请求不匹配，应该淘汰 w1（更旧）

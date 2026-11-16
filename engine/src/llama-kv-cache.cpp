@@ -1114,6 +1114,22 @@ uint32_t llama_kv_cache::get_n_stream() const {
     return n_stream;
 }
 
+llama_kv_cache_stats llama_kv_cache::get_stats() const {
+    llama_kv_cache_stats stats = {};
+    const uint32_t pad = std::max(n_pad, 256u);
+    for (const auto & cells : v_cells) {
+        stats.used_cells += cells.get_used();
+        stats.physical_span = std::max(stats.physical_span, cells.used_max_p1());
+        stats.attention_span = std::max(stats.attention_span,
+            std::min(cells.size(), std::max(pad, GGML_PAD(cells.used_max_p1(), pad))));
+        stats.capacity_cells += cells.size();
+    }
+    for (const auto & entry : ctxs_bufs) {
+        stats.allocated_bytes += ggml_backend_buffer_get_size(entry.second.get());
+    }
+    return stats;
+}
+
 bool llama_kv_cache::get_has_shift() const {
     bool result = false;
 

@@ -39,9 +39,16 @@ def main():
     parser.add_argument('--video-start-at', type=int, default=0,
                         help='First frame with video (zero based); measures cold vision activation')
     parser.add_argument('--interrupt-at', type=int, default=-1)
+    parser.add_argument('--recovery-count', type=int, default=0, help='Serial 1Hz inputs after stress, same session')
+    parser.add_argument('--burst-size', type=int, default=1, help='Transport backlog stress, default serial')
+    parser.add_argument('--interrupt-every', type=int, default=0)
     parser.add_argument('--tts-temperature', type=float, default=0.0)
+    parser.add_argument('--resources', action='store_true', help='Sample Windows process RAM and WDDM memory')
+    parser.add_argument('--memory-file', type=Path, help='Synthetic/user-supplied fact update schedule; never inferred from fixture audio')
+    parser.add_argument('--memory-query', default='', help='Caller text used for lexical fact retrieval')
+    parser.add_argument('--browser-relay', help='Optional localhost playback observer WebSocket; does not drive inference')
     args = parser.parse_args()
-    if (args.count < 1 or args.rounds < 1 or args.interval_ms < 0 or args.video_start_at < 0 or
+    if (args.count < 1 or args.rounds < 1 or args.burst_size < 1 or args.recovery_count < 0 or args.interval_ms < 0 or args.video_start_at < 0 or args.interrupt_every < 0 or
             args.tail_seconds < 0 or not 1 <= args.port <= 65535 or
             not math.isfinite(args.tts_temperature) or args.tts_temperature < 0):
         parser.error('Invalid count, interval, duration or port')
@@ -50,6 +57,8 @@ def main():
     args.output = args.output.resolve()
     args.model_dir = args.model_dir.resolve()
     args.binary_dir = args.binary_dir.resolve()
+    if args.memory_file:
+        args.memory_file = args.memory_file.resolve()
     args.output.mkdir(parents=True, exist_ok=True)
     settings = dict(profile['environment'])
     settings['OMNI_SAMPLER_SEED'] = '42'
@@ -67,7 +76,8 @@ def main():
         key, _, value = override.partition('=')
         settings[key] = value
     os.environ.update(settings)
-    logging.basicConfig(filename=args.output / 'backend.log', level=logging.INFO,
+    logging.basicConfig(filename=args.output / 'backend.log',
+                        level=logging.DEBUG if settings.get('OMNI_KV_TRACE') == '1' else logging.INFO,
                         format='%(asctime)s %(name)s %(message)s', encoding='utf-8')
     sys.path.insert(0, str(ROOT / 'runtime'))
     from core.processors.cpp_backend import CppBackendWorker
@@ -87,11 +97,18 @@ def main():
                 'audio_only': args.audio_only, 'video_start_at': args.video_start_at,
                 'count': args.count, 'rounds': args.rounds, 'interval_ms': args.interval_ms,
                 'tail_seconds': args.tail_seconds, 'interrupt_at': args.interrupt_at,
+                'interrupt_every': args.interrupt_every, 'burst_size': args.burst_size, 'recovery_count': args.recovery_count,
+                'browser_relay': args.browser_relay,
                 'tts_temperature': args.tts_temperature,
                 'gpu_memory_scope': 'whole GPU including desktop and other processes',
                 'speech_quality_accepted': False}
+    if args.memory_file:
+        manifest['memory_fixture'] = json.loads(args.memory_file.read_text(encoding='utf-8'))
+        manifest['memory_query'] = args.memory_query
     monitor = None
     gpu_file = None
+    resource_monitor = None
+    resource_log = None
     try:
         if shutil.which('nvidia-smi'):
             manifest['gpu'] = subprocess.check_output([
@@ -105,10 +122,27 @@ def main():
         started = time.perf_counter()
         worker.load_model()
         manifest['load_ms'] = (time.perf_counter() - started) * 1000
+        if args.resources:
+            if platform.system() != 'Windows':
+                raise ValueError('--resources currently requires Windows WDDM counters')
+            resource_log = (args.output / 'resources.log').open('w', encoding='utf-8')
+            resource_monitor = subprocess.Popen([
+                shutil.which('pwsh') or 'powershell', '-NoProfile', '-File',
+                str(ROOT / 'scripts/windows/measure-resources.ps1'),
+                '-TargetProcessId', str(worker._cpp_process.pid),
+                '-OutputPath', str(args.output / 'resources.csv')],
+                stdout=resource_log, stderr=subprocess.STDOUT,
+                creationflags=subprocess.CREATE_NO_WINDOW)
+            manifest['resource_sampling'] = 'process RAM and WDDM counters, ~1s plus query time, after engine load'
         args.url = f'ws://127.0.0.1:{args.port}/backend'
         for iteration in range(args.rounds):
             asyncio.run(native.replay(args, iteration))
     finally:
+        if resource_monitor is not None:
+            resource_monitor.terminate()
+            resource_monitor.wait(timeout=10)
+        if resource_log is not None:
+            resource_log.close()
         worker._stop_cpp_server()
         if worker._http_client is not None:
             worker._http_client.close()

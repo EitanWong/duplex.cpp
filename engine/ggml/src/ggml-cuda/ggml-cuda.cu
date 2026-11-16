@@ -3305,6 +3305,8 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
     bool res = false;
+    const char * kv_trace = std::getenv("OMNI_KV_TRACE");
+    const bool trace = kv_trace && std::strcmp(kv_trace, "1") == 0;
 
     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
@@ -3320,6 +3322,9 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
 
     // Check if the graph size has changed
     if ((int)graph->node_props.size() != cgraph->n_nodes) {
+        if (trace) GGML_LOG_INFO("KV_GRAPH key=%p uid=%zu reason=node_count old=%zu nodes=%d first=%s last=%s\n",
+            graph_key, cgraph->uid, graph->node_props.size(), cgraph->n_nodes,
+            cgraph->nodes[0]->name, cgraph->nodes[cgraph->n_nodes-1]->name);
         res = true;
         graph->node_props.resize(cgraph->n_nodes);
     }
@@ -3337,6 +3342,25 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         }
 
         if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
+            if (!res && trace) {
+                const auto & old = graph->node_props[i];
+                const bool shape = memcmp(old.node.ne, prop.node.ne, sizeof(prop.node.ne)) != 0 ||
+                    memcmp(old.node_src_ne, prop.node_src_ne, sizeof(prop.node_src_ne)) != 0;
+                const bool pointers = old.node.data != prop.node.data ||
+                    memcmp(old.node_src_data_ptrs, prop.node_src_data_ptrs, sizeof(prop.node_src_data_ptrs)) != 0;
+                const bool strides = memcmp(old.node.nb, prop.node.nb, sizeof(prop.node.nb)) != 0 ||
+                    memcmp(old.node_src_nb, prop.node_src_nb, sizeof(prop.node_src_nb)) != 0;
+                const bool sources = memcmp(old.node.src, prop.node.src, sizeof(prop.node.src)) != 0;
+                const bool params = memcmp(old.node.op_params, prop.node.op_params, sizeof(prop.node.op_params)) != 0;
+                const auto * old_bytes = reinterpret_cast<const unsigned char *>(&old);
+                const auto * new_bytes = reinterpret_cast<const unsigned char *>(&prop);
+                size_t first_diff = 0;
+                while (first_diff < sizeof(prop) && old_bytes[first_diff] == new_bytes[first_diff]) ++first_diff;
+                GGML_LOG_INFO("KV_GRAPH key=%p uid=%zu reason=properties node=%d name=%s op=%s shape=%d pointers=%d old_ne1=%lld ne1=%lld strides=%d sources=%d params=%d old_flags=%d flags=%d first_diff=%zu\n",
+                    graph_key, cgraph->uid, i, prop.node.name, ggml_op_name(prop.node.op), shape, pointers,
+                    (long long)old.node.ne[1], (long long)prop.node.ne[1], strides, sources, params,
+                    old.node.flags, prop.node.flags, first_diff);
+            }
             graph->node_props[i] = prop;
             res = true;
         }
@@ -4514,6 +4538,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 #endif // USE_CUDA_GRAPH
 
+    const char * kv_trace = std::getenv("OMNI_KV_TRACE");
+    const bool time_capture = use_cuda_graph && cuda_graph_update_required && kv_trace && std::strcmp(kv_trace, "1") == 0;
+    const int64_t kv_capture_started = time_capture ? ggml_time_us() : 0;
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
         {
@@ -4525,6 +4552,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    if (time_capture) GGML_LOG_INFO("KV_TIMING stage=cuda_capture_instantiate_launch ms=%.3f key=%p uid=%zu nodes=%d first=%s last=%s\n",
+        (ggml_time_us() - kv_capture_started) / 1000.0, graph_key, cgraph->uid, cgraph->n_nodes,
+        cgraph->nodes[0]->name, cgraph->nodes[cgraph->n_nodes-1]->name);
 
     return GGML_STATUS_SUCCESS;
 }

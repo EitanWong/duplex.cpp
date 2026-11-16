@@ -1,5 +1,11 @@
 # Duplex API quick reference
 
+For authenticated `/v1/realtime` on port 8006, see [ModelBest Realtime](modelbest-realtime.md)
+(official audio/video event format) or [OpenAI Realtime](realtime.md) (GA/Beta audio events).
+Both include LAN WSS and Internet proxy configuration. Select the protocol with the
+`model` query parameter: `MiniCPM-o-4.5-Realtime` or `gpt-realtime` respectively.
+ModelBest and the native API below use 16 kHz float32 input; OpenAI uses 24 kHz PCM16.
+
 The public gateway exposes `ws://localhost:8040/ws/duplex/{session_id}`.
 Use a unique `adx_`-prefixed ID for audio-only sessions or `omni_` for audio/video.
 One session occupies one worker. Listen and send concurrently; do not wait for a
@@ -38,6 +44,11 @@ Keep any nonempty `result.text` even when `is_listen` is true: the model can
 finish speaking and return to listening within the same input chunk.
 Honor `speech_end` metadata when present. The native `engine` WebSocket `/backend`
 is an internal protocol and uses different messages and raw PCM encoding.
+
+The native protocol also has an opt-in, session-local `memory.update` event and
+`metrics.kv` diagnostics. The Python native Worker exposes `duplex_update_memory`;
+the public Gateway/browser does not automatically transcribe or submit facts.
+See the [memory schema and limits](long-session-rtx3060.md#可用的实验文本记忆).
 
 The browser client also supports the existing short-frame endpointing mode.
 For a first integration, use the one-second messages above. See `runtime/worker.py`

@@ -1029,6 +1029,8 @@ def _build_cpp_sampling(cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             out[key] = val
     if cfg.get("decode_mode") == "greedy":
         out["temperature"] = 0.0
+    if "generate_audio" in cfg:
+        out["use_tts"] = bool(cfg["generate_audio"])
     return out
 
 
@@ -2177,6 +2179,7 @@ async def duplex_ws(ws: WebSocket):
     chunk_idx: int = 0
     session_start_perf: float = time.perf_counter()
     duplex_prepared: bool = False
+    duplex_prepare_started: bool = False
     use_deferred_finalize: bool = True
 
     # 保留完整连续输入；队列深度由下方统计任务监测，不静默丢弃历史块。
@@ -2431,6 +2434,7 @@ async def duplex_ws(ws: WebSocket):
             msg_type = msg.get("type", "")
 
             if msg_type == "prepare":
+                duplex_prepare_started = True
                 system_prompt = msg.get("system_prompt", "You are a helpful assistant.")
                 ref_audio_path = msg.get("ref_audio_path")
                 ref_audio_b64 = msg.get("ref_audio_base64")
@@ -2506,7 +2510,8 @@ async def duplex_ws(ws: WebSocket):
                 _client_ref_provided = bool(ref_audio_b64 or ref_audio_path)
                 if not _client_ref_provided and os.path.isfile(_duplex_ref_by_lang):
                     actual_ref_audio_path = _duplex_ref_by_lang
-                    actual_tts_audio_path = _duplex_ref_by_lang
+                    if not actual_tts_audio_path:
+                        actual_tts_audio_path = _duplex_ref_by_lang
 
                 _has_tts_field_d = bool(msg.get("tts_ref_audio_base64"))
                 _tts_same_as_llm = (tts_ref_audio_b64 == ref_audio_b64) if tts_ref_audio_b64 else True
@@ -2734,7 +2739,8 @@ async def duplex_ws(ws: WebSocket):
                 # Stop 后立即进入非活跃（LOADING）状态，避免新会话被过早接入
                 worker.state.status = WorkerStatus.LOADING
                 worker.state.duplex_pause_time = None
-                worker.duplex_stop()
+                if duplex_prepare_started:
+                    worker.duplex_stop()
                 await ws.send_json({"type": "stopped"})
                 break
 
@@ -2777,17 +2783,21 @@ async def duplex_ws(ws: WebSocket):
             except Exception:
                 audio_chunk_worker_task.cancel()
 
-        try:
-            worker.duplex_stop()
-        except Exception:
-            pass
+        if duplex_prepare_started:
+            try:
+                worker.duplex_stop()
+            except Exception:
+                pass
 
         worker.state.status = WorkerStatus.LOADING
         try:
-            if hasattr(worker, 'full_reinit'):
-                await asyncio.to_thread(worker.full_reinit)
-            else:
-                await asyncio.to_thread(worker.duplex_cleanup)
+            # A connection closed before prepare never touched model state.
+            # Failed preparation still needs the full cleanup path.
+            if duplex_prepare_started:
+                if hasattr(worker, 'full_reinit'):
+                    await asyncio.to_thread(worker.full_reinit)
+                else:
+                    await asyncio.to_thread(worker.duplex_cleanup)
             worker.state.status = WorkerStatus.IDLE
         except Exception as e:
             logger.error(f"Duplex reinit failed: {e}", exc_info=True)

@@ -4,6 +4,7 @@
 #include "omni.h"
 #include "token2wav/token2wav-impl.h"
 #include "tts-cpu-head.h"
+#include "kv-budget.h"
 
 #include "llama.h"
 #include "common/common.h"
@@ -355,7 +356,7 @@ struct LLMOut {
 };
 
 // 前向声明
-static void kv_cache_slide_window(struct omni_context* ctx_omni, common_params* params, int chunk_size);
+static bool kv_cache_slide_window(struct omni_context* ctx_omni, common_params* params, int chunk_size);
 
 //
 // omni mtmd embed
@@ -387,7 +388,7 @@ bool omni_eval_embed(llama_context * ctx_llama, const struct omni_embed * omni_e
 }
 
 bool prefill_with_emb(struct omni_context * ctx_omni, common_params * params, float* embed, int n_pos, int n_batch, int*n_past) {
-    kv_cache_slide_window(ctx_omni, params, n_pos);
+    if (!kv_cache_slide_window(ctx_omni, params, n_pos)) { ctx_omni->kv_input_failed = true; return false; }
     
     int n_embd  = llama_n_embd(llama_get_model(ctx_omni->ctx_llama));
     for (int i = 0; i < n_pos; i += n_batch) {
@@ -405,6 +406,10 @@ bool prefill_with_emb(struct omni_context * ctx_omni, common_params * params, fl
         batch.pos = pos_vec.data();
         
         if (llama_decode(ctx_omni->ctx_llama, batch)) {
+            // A failed decode can have inserted cells before reporting failure.
+            // Remove this batch before returning; retire the session on failure.
+            llama_memory_seq_rm(llama_get_memory(ctx_omni->ctx_llama), 0, *n_past, -1);
+            ctx_omni->kv_input_failed = true;
             LOG_ERR("%s : failed to eval\n", __func__);
             return false;
         }
@@ -421,7 +426,7 @@ bool prefill_emb_with_hidden(struct omni_context * ctx_omni, common_params * par
         return true;
     }
 
-    kv_cache_slide_window(ctx_omni, params, n_pos);
+    if (!kv_cache_slide_window(ctx_omni, params, n_pos)) { ctx_omni->kv_input_failed = true; return false; }
 
     int n_embd = llama_n_embd(llama_get_model(ctx_omni->ctx_llama));
 
@@ -453,6 +458,10 @@ bool prefill_emb_with_hidden(struct omni_context * ctx_omni, common_params * par
         llama_set_embeddings(ctx_omni->ctx_llama, true);
 
         if (llama_decode(ctx_omni->ctx_llama, batch)) {
+            // A failed decode can have inserted cells before reporting failure.
+            // Remove this batch before returning; retire the session on failure.
+            llama_memory_seq_rm(llama_get_memory(ctx_omni->ctx_llama), 0, *n_past, -1);
+            ctx_omni->kv_input_failed = true;
             LOG_ERR("%s : failed to eval\n", __func__);
             llama_set_embeddings(ctx_omni->ctx_llama, false);
             free(hidden_states);
@@ -1006,217 +1015,165 @@ struct omni_embed * omni_audio_embed_make_with_filename(struct audition_ctx * ct
 //
 // omni llm eval
 //
-static void kv_cache_slide_window(struct omni_context* ctx_omni, common_params* params, int chunk_size) {
-    const int n_ctx = params->n_ctx;
-    // Invalidate conservatively before any window could move cached positions.
-    if (ctx_omni->n_past + chunk_size >= n_ctx - 1024) {
-        ctx_omni->text_prompt_cache.clear();
+static void kv_publish_stats(omni_context * ctx) {
+    ctx->kv_completed_turn.store(ctx->current_turn_id);
+    int accounted = ctx->system_preserve_length;
+    for (const auto & unit : ctx->unit_history) accounted += unit.length;
+    if (ctx->pending_unit_id >= 0) accounted += ctx->n_past - ctx->pending_unit_start_cache_len;
+    ctx->kv_accounted_tokens.store(ctx->sliding_window_config.mode == "off" ? -1 : accounted);
+    llama_kv_cache_stats stats = {};
+    if (llama_memory_get_kv_stats(llama_get_memory(ctx->ctx_llama), &stats)) {
+        ctx->kv_used.store(stats.used_cells);
+        ctx->kv_physical_span.store(stats.physical_span);
+        ctx->kv_attention_span.store(stats.attention_span);
+        ctx->kv_capacity.store(stats.capacity_cells);
+        ctx->kv_allocated_bytes.store(stats.allocated_bytes);
+    }
+}
+
+static bool kv_trace_enabled() {
+    const char * value = std::getenv("OMNI_KV_TRACE");
+    return value && std::strcmp(value, "1") == 0;
+}
+
+// The only prefix-rm/position-shift transaction used by both window policies.
+// No ledger is committed before the backend confirms removal. This does not
+// move physical cells or shrink allocated buffers; RoPE is applied by decode.
+static bool kv_remove_range(omni_context * ctx, int begin, int end,
+                            const char * reason, bool reconcile_units = true) {
+    const int before = ctx->n_past;
+    auto mem = llama_get_memory(ctx->ctx_llama);
+    if (begin < 0 || end <= begin || end > before || !mem || !llama_memory_can_shift(mem)) return false;
+    if (llama_memory_seq_pos_max(mem, 0) != before - 1) {
+        LOG_ERR("KV ledger mismatch before eviction: past=%d max=%d\n", before, llama_memory_seq_pos_max(mem, 0));
+        return false;
+    }
+    const auto started = std::chrono::steady_clock::now();
+    if (!llama_memory_seq_rm(mem, 0, begin, end)) return false;
+    const auto removed = std::chrono::steady_clock::now();
+    const int count = end - begin;
+    llama_memory_seq_add(mem, 0, end, before, -count);
+    const auto shifted = std::chrono::steady_clock::now();
+    if (reconcile_units) {
+        int pos = ctx->system_preserve_length;
+        std::vector<UnitEntry> retained;
+        for (auto unit : ctx->unit_history) {
+            const int next = pos + unit.length;
+            unit.length -= std::max(0, std::min(next, end) - std::max(pos, begin));
+            if (unit.length > 0) retained.push_back(std::move(unit));
+            pos = next;
+        }
+        ctx->unit_history = std::move(retained);
+    }
+    if (ctx->pending_unit_id >= 0) {
+        ctx->pending_unit_start_cache_len -= std::max(0, std::min(ctx->pending_unit_start_cache_len, end) - begin);
+    }
+    std::vector<int> rounds;
+    for (int pos : ctx->round_start_positions) {
+        if (pos > end) rounds.push_back(pos - count);
+    }
+    ctx->round_start_positions = std::move(rounds);
+    ctx->n_past -= count;
+    ctx->position_offset += count;
+    ctx->text_prompt_cache.clear();
+    ctx->kv_evictions.fetch_add(1);
+    ctx->kv_evicted_tokens.fetch_add(count);
+    const double rm_ms = std::chrono::duration<double, std::milli>(removed - started).count();
+    const double shift_ms = std::chrono::duration<double, std::milli>(shifted - removed).count();
+    ctx->kv_prune_ms.store(ctx->kv_prune_ms.load() + rm_ms + shift_ms);
+    kv_publish_stats(ctx);
+    if (kv_trace_enabled()) {
+        LOG_INF("KV_EVENT reason=%s range=[%d,%d) past=%d->%d shift=-%d turns=%zu units=%zu "
+                "used=%d physical=%d scan=%d capacity=%d rm_ms=%.3f shift_metadata_ms=%.3f\n",
+                reason, begin, end, before, ctx->n_past, count, ctx->round_start_positions.size(), ctx->unit_history.size(),
+                ctx->kv_used.load(), ctx->kv_physical_span.load(), ctx->kv_attention_span.load(),
+                ctx->kv_capacity.load(), rm_ms, shift_ms);
+    }
+    return true;
+}
+
+static bool kv_cache_slide_window(struct omni_context* ctx, common_params* params, int chunk_size) {
+    const int n_ctx = llama_n_ctx(ctx->ctx_llama);
+    if (ctx->sliding_window_config.mode != "off") ctx->n_keep = std::max(ctx->n_keep, ctx->system_preserve_length);
+    if (ctx->n_past + chunk_size >= n_ctx - 1024) ctx->text_prompt_cache.clear();
+    if (ctx->duplex_mode && ctx->sliding_window_config.mode == "turn") {
+        const int prefix = std::max(ctx->n_keep, ctx->system_preserve_length);
+        const int reserve = std::max(32, ctx->max_new_speak_tokens_per_chunk + 16);
+        std::vector<int> units;
+        int pos = ctx->system_preserve_length;
+        for (const auto & unit : ctx->unit_history) {
+            pos += unit.length;
+            units.push_back(pos);
+        }
+        const auto plan = omni_plan_kv(n_ctx, prefix, ctx->n_past, chunk_size,
+                                      reserve, ctx->round_start_positions, units);
+        if (!plan.fits) {
+            LOG_ERR("KV budget: input=%d reserve=%d prefix=%d past=%d capacity=%d; no complete unit fits\n",
+                    chunk_size, reserve, prefix, ctx->n_past, n_ctx);
+            ctx->kv_input_failed = true;
+            return false;
+        }
+        if (plan.end > prefix) {
+            if (!kv_remove_range(ctx, prefix, plan.end, plan.unit_fallback ? "capacity-unit" : "capacity-turn")) {
+                ctx->kv_input_failed = true;
+                return false;
+            }
+            if (plan.unit_fallback) ctx->kv_unit_fallbacks.fetch_add(1);
+        }
+        return true;
     }
 
-    // ==================== 双工模式：按轮次边界智能清理 ====================
-    if (ctx_omni->duplex_mode) {
-        // Retain the 4K+ policy; smaller contexts need distinct high/low watermarks.
+    // Keep the measured legacy selection policy as the default. Both policies
+    // share failure handling and update every positional ledger transactionally.
+    int end = ctx->n_keep;
+    if (ctx->duplex_mode) {
         const int headroom = n_ctx >= 4096 ? 2048 : n_ctx / 4;
-        const int duplex_trigger = std::max(ctx_omni->n_keep, n_ctx - headroom);
-
-        if (ctx_omni->n_past + chunk_size < duplex_trigger) {
-            return;
-        }
-
-        // defer：生成中 / TTS 忙 / 正在 SPEAK 时不滑窗，除非快要撞上 n_ctx 硬限制
-        bool generating    = ctx_omni->text_streaming;
-        bool tts_busy      = !ctx_omni->speek_done;
-        bool mid_speak     = !ctx_omni->slide_last_was_listen.load();
-        bool force_slide   = (ctx_omni->n_past + chunk_size >= n_ctx - 512);
-
-        if (!force_slide && (generating || tts_busy || mid_speak)) {
-            return;
-        }
-        if (force_slide) {
-            print_with_timestamp("⚠️ slide FORCE: n_past=%d approaching n_ctx=%d\n",
-                                 ctx_omni->n_past, n_ctx);
-        }
-
-        int old_n_past = ctx_omni->n_past;
-        const auto& rounds = ctx_omni->round_start_positions;
-        const int total_rounds = (int)rounds.size();
-        // The incoming multimodal batch must fit alongside the protected prefix.
-        // A fixed 2048-token tail cannot fit in smaller contexts (or large batches).
-        const int history_budget = n_ctx - ctx_omni->n_keep - chunk_size;
-        if (history_budget < 0) {
-            LOG_ERR("KV slide: incoming batch (%d) and protected prefix (%d) exceed context (%d)\n",
-                    chunk_size, ctx_omni->n_keep, n_ctx);
-            return;
-        }
-        const int target_keep_tokens = std::min({std::max(n_ctx / 4, 2048), n_ctx / 2, history_budget});
-
-        print_with_timestamp("⚠️ slide TRIGGERED: n_past=%d, chunk=%d, trigger=%d, n_ctx=%d, n_keep=%d, rounds=%d\n",
-                             ctx_omni->n_past, chunk_size, duplex_trigger, n_ctx,
-                             ctx_omni->n_keep, total_rounds);
-
-        if (total_rounds < 2) {
-            // 轮次边界不足（一轮超长对话）：不做全量清空，尽量保留最近一段 KV。
-            // 原行为是丢掉 [n_keep, n_past)，模型立刻失忆 → 连续长对话下触发后模型会
-            // 陷入长时间 LISTEN / 彻底失控（case 3、case 4）。
-            // 改为按 tail window 保留最近 target_keep_tokens，通过左移 KV 对齐位置。
-            int keep_from = ctx_omni->n_past - target_keep_tokens;
-            keep_from = std::max(keep_from, ctx_omni->n_keep);
-            int n_discard = keep_from - ctx_omni->n_keep;
-
-            if (n_discard <= 0) {
-                print_with_timestamp("⚠️ slide skipped (rounds<2): nothing to discard (n_past=%d, target_keep=%d)\n",
-                                     ctx_omni->n_past, target_keep_tokens);
-            } else {
-                llama_memory_t mem = llama_get_memory(ctx_omni->ctx_llama);
-                if (mem && llama_memory_can_shift(mem) &&
-                    llama_memory_seq_rm(mem, 0, ctx_omni->n_keep, keep_from)) {
-                    llama_memory_seq_add(mem, 0, keep_from, ctx_omni->n_past, -n_discard);
-                } else {
-                    LOG_ERR("KV slide: removal failed; retaining position bookkeeping\n");
-                    return;
-                }
-                ctx_omni->n_past -= n_discard;
-                // 没有可信的 round boundary 了，清空以避免后续按错位的 boundary 切割
-                ctx_omni->round_start_positions.clear();
-                // TTS owns its independent 4096-token history. A main-model
-                // slide can overlap acoustic decode and must not mutate it.
-                print_with_timestamp("⚠️ slide DONE: rounds<2 tail-keep: n_past %d→%d, freed %d (kept last %d), TTS KV preserved\n",
-                                     old_n_past, ctx_omni->n_past, n_discard, target_keep_tokens);
-            }
+        if (ctx->n_past + chunk_size < std::max(ctx->n_keep, n_ctx - headroom)) return true;
+        const bool force = ctx->n_past + chunk_size >= n_ctx - 512;
+        if (!force && (ctx->text_streaming || !ctx->speek_done || !ctx->slide_last_was_listen.load())) return true;
+        const int budget = n_ctx - ctx->n_keep - chunk_size;
+        if (budget < 0) return false;
+        const int target = std::min({std::max(n_ctx / 4, 2048), n_ctx / 2, budget});
+        const auto & rounds = ctx->round_start_positions;
+        if (rounds.size() < 2) {
+            end = std::max(ctx->n_keep, ctx->n_past - target);
         } else {
-            // 保留约 n_ctx/4 的上下文，按 round boundary 对齐截断
-            const int min_keep_from_pos  = ctx_omni->n_past - target_keep_tokens;
-
-            int keep_from = rounds[total_rounds - 2];
-            for (int i = 0; i <= total_rounds - 2; i++) {
-                if (rounds[i] >= min_keep_from_pos) {
-                    keep_from = rounds[i];
-                    break;
-                }
+            end = rounds[rounds.size() - 2];
+            for (size_t i = 0; i + 1 < rounds.size(); ++i) {
+                if (rounds[i] >= ctx->n_past - target) { end = rounds[i]; break; }
             }
-            keep_from = std::max(keep_from, ctx_omni->n_keep);
-            // A single long active turn may have no recent complete boundary.
-            // Use the existing tail fallback only when needed to fit this batch.
-            keep_from = std::max(keep_from, ctx_omni->n_past - history_budget);
-
-            int n_discard = keep_from - ctx_omni->n_keep;
-
-            if (n_discard <= 0) {
-                print_with_timestamp("⚠️ slide: nothing to discard (keep_from=%d <= n_keep=%d)\n",
-                                     keep_from, ctx_omni->n_keep);
-            } else {
-                llama_memory_t mem = llama_get_memory(ctx_omni->ctx_llama);
-                if (mem && llama_memory_can_shift(mem) &&
-                    llama_memory_seq_rm(mem, 0, ctx_omni->n_keep, keep_from)) {
-                    llama_memory_seq_add(mem, 0, keep_from, ctx_omni->n_past, -n_discard);
-                } else {
-                    LOG_ERR("KV slide: removal failed; retaining position bookkeeping\n");
-                    return;
-                }
-                ctx_omni->n_past -= n_discard;
-
-                std::vector<int> new_rounds;
-                for (int i = 0; i < total_rounds; i++) {
-                    if (rounds[i] > keep_from) {
-                        new_rounds.push_back(rounds[i] - n_discard);
-                    }
-                }
-                ctx_omni->round_start_positions = new_rounds;
-
-                // TTS owns its independent 4096-token history. A main-model
-                // slide can overlap acoustic decode and must not mutate it.
-
-                print_with_timestamp("⚠️ slide DONE: n_past %d→%d, freed %d, boundaries_kept=%d, TTS KV preserved\n",
-                                     old_n_past, ctx_omni->n_past, n_discard, (int)new_rounds.size());
+            end = std::max({end, ctx->n_keep, ctx->n_past - budget});
+        }
+    } else {
+        if (ctx->n_past + chunk_size < n_ctx) return true;
+        const auto & rounds = ctx->round_start_positions;
+        if (ctx->max_preserved_context > 0 && !rounds.empty()) {
+            int length = 0, keep = (int)rounds.size();
+            for (int i = (int)rounds.size() - 1; i >= 0; --i) {
+                const int start = i == 0 ? ctx->n_keep : rounds[i-1];
+                if (length + rounds[i] - start > ctx->max_preserved_context) break;
+                length += rounds[i] - start;
+                keep = i;
             }
+            keep = std::min(keep, (int)rounds.size() - 1);
+            if (keep > 0) end = rounds[keep-1];
         }
-        return;
+        if (end == ctx->n_keep) end += (ctx->n_past - ctx->n_keep) / 2;
+        // A large input must fit even when retaining half of the old history
+        // would not be enough. Never claim success for an impossible request.
+        end = std::max(end, ctx->n_past + chunk_size - n_ctx + ctx->n_keep);
     }
-
-    // ==================== 非双工模式：原有滑窗逻辑 ====================
-    if (ctx_omni->n_past + chunk_size < n_ctx) {
-        return;
+    const bool legacy_tail = ctx->duplex_mode && ctx->round_start_positions.size() < 2;
+    if (end > ctx->n_keep) {
+        if (!kv_remove_range(ctx, ctx->n_keep, end, "legacy")) return false;
+        if (legacy_tail) ctx->round_start_positions.clear();
     }
-    
-    print_with_timestamp("⚠️ KV Cache 滑动窗口触发: n_past=%d, chunk_size=%d, n_ctx=%d, n_keep=%d, 轮次数=%zu\n",
-                         ctx_omni->n_past, chunk_size, n_ctx, ctx_omni->n_keep, 
-                         ctx_omni->round_start_positions.size());
-    
-    int n_discard = 0;
-    int delete_end_pos = ctx_omni->n_keep;
-    
-    if (ctx_omni->max_preserved_context > 0 && ctx_omni->round_start_positions.size() >= 1) {
-        const auto& rounds = ctx_omni->round_start_positions;
-        int cumulative_length = 0;
-        int keep_from_round = rounds.size();
-        int total_rounds = rounds.size();
-        
-        for (int i = total_rounds - 1; i >= 0; --i) {
-            int round_start = (i == 0) ? ctx_omni->n_keep : rounds[i - 1];
-            int round_end = rounds[i];
-            int round_length = round_end - round_start;
-            
-            if (cumulative_length + round_length > ctx_omni->max_preserved_context) {
-                break;
-            }
-            
-            cumulative_length += round_length;
-            keep_from_round = i;
-        }
-        
-        if (keep_from_round >= total_rounds) {
-            keep_from_round = total_rounds - 1;
-        }
-        
-        int delete_start = ctx_omni->n_keep;
-        delete_end_pos = (keep_from_round == 0) ? ctx_omni->n_keep : rounds[keep_from_round - 1];
-        
-        if (delete_end_pos > delete_start) {
-            n_discard = delete_end_pos - delete_start;
-            
-            std::vector<int> new_rounds;
-            for (int i = keep_from_round; i < total_rounds; ++i) {
-                new_rounds.push_back(rounds[i] - n_discard);
-            }
-            ctx_omni->round_start_positions = new_rounds;
-        } else {
-            n_discard = 0;
-        }
-    }
-    
-    if (n_discard == 0) {
-        const int n_left = ctx_omni->n_past - ctx_omni->n_keep;
-        n_discard = n_left / 2;
-        delete_end_pos = ctx_omni->n_keep + n_discard;
-        
-        if (n_left <= 0 || n_discard <= 0) {
-            return;
-        }
-        
-        std::vector<int> new_rounds;
-        for (int pos : ctx_omni->round_start_positions) {
-            if (pos > delete_end_pos) {
-                new_rounds.push_back(pos - n_discard);
-            }
-        }
-        ctx_omni->round_start_positions = new_rounds;
-    }
-    
-    llama_memory_t mem = llama_get_memory(ctx_omni->ctx_llama);
-    if (mem) {
-        bool rm_ok = llama_memory_seq_rm(mem, 0, ctx_omni->n_keep, delete_end_pos);
-        (void)rm_ok;
-        llama_memory_seq_add(mem, 0, delete_end_pos, ctx_omni->n_past, -n_discard);
-    }
-    
-    int old_n_past = ctx_omni->n_past;
-    ctx_omni->n_past -= n_discard;
-    print_with_timestamp("⚠️ KV Cache 滑动窗口完成: n_past %d→%d\n", old_n_past, ctx_omni->n_past);
+    return ctx->n_past + chunk_size <= n_ctx;
 }
 
 static bool eval_tokens(struct omni_context* ctx_omni, common_params* params, std::vector<llama_token> tokens, int n_batch, int * n_past, bool get_emb = false) {
     int N = (int) tokens.size();
-    kv_cache_slide_window(ctx_omni, params, N);
+    if (!kv_cache_slide_window(ctx_omni, params, N)) { ctx_omni->kv_input_failed = true; return false; }
 
     for (int i = 0; i < N; i += n_batch) {
         int n_eval = (int) tokens.size() - i;
@@ -1240,6 +1197,10 @@ static bool eval_tokens(struct omni_context* ctx_omni, common_params* params, st
         }
         
         if (llama_decode(ctx_omni->ctx_llama, batch)) {
+            // A failed decode can have inserted cells before reporting failure.
+            // Remove this batch before returning; retire the session on failure.
+            llama_memory_seq_rm(llama_get_memory(ctx_omni->ctx_llama), 0, *n_past, -1);
+            ctx_omni->kv_input_failed = true;
             LOG_ERR("%s : failed to eval. token %d/%d (batch size %d, n_past %d)\n", __func__, i, N, n_batch, *n_past);
             return false;
         }
@@ -1260,7 +1221,7 @@ static bool eval_tokens_with_hidden(struct omni_context* ctx_omni, common_params
         return true;
     }
 
-    kv_cache_slide_window(ctx_omni, params, N);
+    if (!kv_cache_slide_window(ctx_omni, params, N)) { ctx_omni->kv_input_failed = true; return false; }
 
     const int n_embd = llama_n_embd(llama_get_model(ctx_omni->ctx_llama));
 
@@ -1295,6 +1256,10 @@ static bool eval_tokens_with_hidden(struct omni_context* ctx_omni, common_params
         }
 
         if (llama_decode(ctx_omni->ctx_llama, batch)) {
+            // A failed decode can have inserted cells before reporting failure.
+            // Remove this batch before returning; retire the session on failure.
+            llama_memory_seq_rm(llama_get_memory(ctx_omni->ctx_llama), 0, *n_past, -1);
+            ctx_omni->kv_input_failed = true;
             LOG_ERR("%s : failed to eval. token %d/%d (batch size %d, n_past %d)\n", __func__, i, N, n_batch, *n_past);
             llama_set_embeddings(ctx_omni->ctx_llama, false);
             free(hidden_states);
@@ -3554,6 +3519,20 @@ void sliding_window_reset(struct omni_context * ctx_omni) {
     
     int old_unit_count = ctx_omni->unit_history.size();
     
+    ctx_omni->kv_used = ctx_omni->kv_physical_span = ctx_omni->kv_attention_span = ctx_omni->kv_capacity = 0;
+    ctx_omni->kv_allocated_bytes = 0;
+    ctx_omni->kv_evictions = ctx_omni->kv_evicted_tokens = ctx_omni->kv_unit_fallbacks = 0;
+    ctx_omni->kv_prune_ms = 0.0;
+    ctx_omni->kv_input_failed = false;
+    ctx_omni->kv_completed_turn = 0;
+    {
+        std::lock_guard<std::mutex> lock(ctx_omni->memory_mutex);
+        ctx_omni->memory_pending_text.clear();
+        ctx_omni->memory_last_text.clear();
+        ctx_omni->memory_last_unit_id = -1;
+    }
+    ctx_omni->memory_injections = ctx_omni->memory_tokens = 0;
+    ctx_omni->memory_prefill_ms = ctx_omni->memory_retrieval_ms = 0.0;
     ctx_omni->unit_history.clear();
     ctx_omni->next_unit_id = 0;
     ctx_omni->pending_unit_id = -1;
@@ -3673,60 +3652,10 @@ void sliding_window_register_system_prompt(struct omni_context * ctx_omni) {
  *      "inconsistent sequence positions: X = old_pmax, Y = n_past, requires Y = X + 1"
  *      这与 kv_cache_slide_window 里采用的策略保持一致。
  */
-bool sliding_window_drop_tokens_from_cache(struct omni_context * ctx_omni, int length) {
-    if (!ctx_omni || !ctx_omni->ctx_llama || length <= 0) {
-        print_with_timestamp("[SW] drop_tokens: invalid params (length=%d)\n", length);
-        return false;
-    }
-    
-    int cache_len_before = get_cache_length(ctx_omni);
-    int preserve = ctx_omni->system_preserve_length;
-    
-    if (cache_len_before <= preserve) {
-        print_with_timestamp("[SW] drop_tokens: cache_len=%d <= preserve=%d, nothing to drop\n",
-                            cache_len_before, preserve);
-        return false;
-    }
-    
-    int available = cache_len_before - preserve;
-    if (available < length) {
-        print_with_timestamp("[SW] drop_tokens: cannot drop %d tokens, only %d available (cache=%d, preserve=%d)\n",
-                            length, available, cache_len_before, preserve);
-        return false;
-    }
-    
-    llama_memory_t mem = llama_get_memory(ctx_omni->ctx_llama);
-    if (!mem) {
-        print_with_timestamp("[SW] drop_tokens: failed to get llama memory\n");
-        return false;
-    }
-    
-    // 1) 删除 [preserve, preserve + length) 区间的 KV
-    bool success = llama_memory_seq_rm(mem, 0, preserve, preserve + length);
-    
-    if (success) {
-        // 2) 把后段 [preserve + length, cache_len_before) 的 position
-        //    整体往前平移 length，保证 KV 中 position 连续，下一次 decode 不会触发
-        //    "inconsistent sequence positions" 错误。
-        //    与 kv_cache_slide_window 的处理方式一致。
-        if (cache_len_before > preserve + length) {
-            llama_memory_seq_add(mem, 0, preserve + length, cache_len_before, -length);
-        }
-
-        ctx_omni->n_past = cache_len_before - length;
-
-        // position_offset 字段已不再用于位置修正，仅保留累计值用于诊断/兼容旧日志
-        ctx_omni->position_offset += length;
-
-        print_with_timestamp("[SW] drop_tokens: SUCCESS, dropped %d tokens from [%d, %d), shifted [%d, %d) by -%d, cache %d -> %d\n",
-                            length, preserve, preserve + length,
-                            preserve + length, cache_len_before, length,
-                            cache_len_before, ctx_omni->n_past);
-    } else {
-        print_with_timestamp("[SW] drop_tokens: FAILED to drop %d tokens\n", length);
-    }
-    
-    return success;
+bool sliding_window_drop_tokens_from_cache(struct omni_context * ctx, int length) {
+    if (!ctx || !ctx->ctx_llama || length <= 0) return false;
+    return kv_remove_range(ctx, ctx->system_preserve_length,
+                           ctx->system_preserve_length + length, "unit-policy", false);
 }
 
 /**
@@ -3888,6 +3817,13 @@ static bool sliding_window_drop_next_unit(struct omni_context * ctx_omni) {
 bool sliding_window_enforce(struct omni_context * ctx_omni) {
     if (!ctx_omni) return false;
     
+    // Native duplex has one planner, including when the legacy HTTP API sets
+    // the unit/turn mode. It must never run a second independent cropper.
+    if (ctx_omni->duplex_mode && ctx_omni->sliding_window_config.mode == "turn") {
+        const int before = ctx_omni->n_past;
+        kv_cache_slide_window(ctx_omni, ctx_omni->params, 0);
+        return ctx_omni->n_past < before;
+    }
     const auto& cfg = ctx_omni->sliding_window_config;
     
     // 检查是否启用滑窗
@@ -4030,6 +3966,7 @@ struct DuplexEncodeReq {
     std::string aud_fname;
     std::string img_fname;
     int         index;
+    std::chrono::steady_clock::time_point submitted = std::chrono::steady_clock::now();
     int         max_slice_nums;  // -1 = 使用全局
 };
 
@@ -4037,6 +3974,8 @@ struct DuplexPrefillPacket {
     std::vector<std::vector<float>> vision_embed;  // [0]=overview, [1..]=slices
     std::vector<float>              audio_embed;
     int                             index = 0;
+    std::chrono::steady_clock::time_point submitted;
+    std::chrono::steady_clock::time_point encoded;
 };
 
 struct DuplexDecodeReq {
@@ -9783,6 +9722,8 @@ static void duplex_encoder_thread_func(omni_context * ctx_omni, common_params * 
 
         DuplexPrefillPacket * packet = new DuplexPrefillPacket();
         packet->index = req->index;
+        packet->submitted = req->submitted;
+        ctx_omni->input_queue_ms.store(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - req->submitted).count());
 
         const bool has_img = !req->img_fname.empty() && ctx_omni->ctx_vision != nullptr;
         const bool has_aud = !req->aud_fname.empty();
@@ -9868,6 +9809,7 @@ static void duplex_encoder_thread_func(omni_context * ctx_omni, common_params * 
             (vpm_ms + apm_ms) - enc_wall_ms);
 
         delete req;
+        packet->encoded = std::chrono::steady_clock::now();
 
         // ---- push to llm prefill_queue ----
         {
@@ -10050,6 +9992,53 @@ static inline void append_raw_emb(std::vector<float> & fused,
 //
 // 如果 emb_cache 未初始化，回退到原始多段路径（duplex_do_prefill_one）。
 // ---------------------------------------------------------------------------
+static bool duplex_inject_memory(omni_context * ctx, common_params * params, int incoming) {
+    std::string text;
+    {
+        std::lock_guard<std::mutex> lock(ctx->memory_mutex);
+        text = ctx->memory_pending_text;
+    }
+    if (text.empty()) return true;
+    if (!kv_cache_slide_window(ctx, params, incoming)) return false;
+    // This runs on the sole LLM thread before the next input. The WS handler
+    // already marks text_streaming when it schedules that input, so that flag
+    // cannot identify an unfinished previous turn. Use the actual KV boundary.
+    if (!ctx->slide_last_was_listen.load() ||
+        ctx->round_start_positions.empty() || ctx->round_start_positions.back() != ctx->n_past) return true;
+    // An eviction elsewhere does not invalidate a still-resident memory unit.
+    // Turn mode removes complete units; inject again only when this one left KV
+    // or retrieval selected different quotations.
+    if (text == ctx->memory_last_text && std::any_of(ctx->unit_history.begin(), ctx->unit_history.end(),
+        [&](const UnitEntry & unit) { return unit.unit_id == ctx->memory_last_unit_id && unit.type == "memory"; })) return true;
+    // Quotes cannot turn tokenizer special-token strings into control tokens.
+    auto body = common_tokenize(ctx->ctx_llama, text, false, false);
+    if (body.size() > 512) return true;
+    auto tokens = common_tokenize(ctx->ctx_llama, "<unit>", false, true);
+    tokens.insert(tokens.end(), body.begin(), body.end());
+    auto suffix = common_tokenize(ctx->ctx_llama, "</unit>", false, true);
+    tokens.insert(tokens.end(), suffix.begin(), suffix.end());
+    if (tokens.size() > 512) return true;
+    if ((int)tokens.size() + incoming + ctx->n_keep + 32 > (int)llama_n_ctx(ctx->ctx_llama)) return true;
+    if (!kv_cache_slide_window(ctx, params, incoming + (int)tokens.size())) return false;
+    const int start = ctx->n_past;
+    const auto begin = std::chrono::steady_clock::now();
+    if (!eval_tokens(ctx, params, tokens, params->n_batch, &ctx->n_past)) return false;
+    UnitEntry unit;
+    unit.unit_id = ctx->next_unit_id++;
+    unit.length = ctx->n_past - start;
+    unit.type = "memory";
+    unit.turn_id = ctx->current_turn_id;
+    ctx->memory_last_unit_id = unit.unit_id;
+    ctx->unit_history.push_back(std::move(unit));
+    ctx->memory_last_text = std::move(text);
+    ctx->memory_injections.fetch_add(1);
+    ctx->memory_tokens.fetch_add((int)tokens.size());
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+    ctx->memory_prefill_ms.store(ctx->memory_prefill_ms.load() + ms);
+    if (kv_trace_enabled()) LOG_INF("KV_MEMORY turn=%d tokens=%zu prefill_ms=%.3f\n", ctx->current_turn_id, tokens.size(), ms);
+    return true;
+}
+
 static bool duplex_do_prefill_one_fused(omni_context * ctx_omni, common_params * params,
                                         DuplexPrefillPacket * packet,
                                         int hidden_size) {
@@ -10065,9 +10054,6 @@ static bool duplex_do_prefill_one_fused(omni_context * ctx_omni, common_params *
     bool has_audio  = (n_audio_tokens > 0);
     bool has_vision = !packet->vision_embed.empty();
 
-    if (ctx_omni->sliding_window_config.mode != "off") {
-        sliding_window_register_unit_start(ctx_omni);
-    }
 
     std::vector<float> fused;
     fused.reserve(128 * (size_t)hidden_size);
@@ -10114,6 +10100,14 @@ static bool duplex_do_prefill_one_fused(omni_context * ctx_omni, common_params *
         return false;
     }
 
+    if (!duplex_inject_memory(ctx_omni, params, fused_ntok)) {
+        ctx_omni->kv_input_failed = true;
+        return false;
+    }
+    if (ctx_omni->sliding_window_config.mode != "off") {
+        sliding_window_register_unit_start(ctx_omni);
+    }
+
     // One shot prefill: 77 tokens 远小于 n_batch(512)，实际只会 1 次 llama_decode。
     if (!prefill_with_emb(ctx_omni, params, fused.data(),
                           fused_ntok, params->n_batch, &ctx_omni->n_past)) {
@@ -10136,11 +10130,24 @@ static bool duplex_do_prefill_one_fused(omni_context * ctx_omni, common_params *
     return true;
 }
 
-static void duplex_do_prefill_one(omni_context * ctx_omni, common_params * params,
+static bool duplex_do_prefill_one(omni_context * ctx_omni, common_params * params,
                                   DuplexPrefillPacket * packet,
                                   int hidden_size) {
     auto t_begin   = std::chrono::high_resolution_clock::now();
     int  n_past_0  = ctx_omni->n_past;
+
+    int incoming = 0;
+    const auto count_text = [&](const char * text) { return (int)common_tokenize(ctx_omni->ctx_llama, text, false, true).size(); };
+    if (!packet->vision_embed.empty()) {
+        incoming += count_text("<unit><image>") + count_text("</image>");
+        for (size_t i = 0; i < packet->vision_embed.size(); ++i) {
+            incoming += (int)packet->vision_embed[i].size() / hidden_size;
+            if (i) incoming += count_text("<slice>") + count_text("</slice>");
+        }
+        if (packet->vision_embed.size() > 1) incoming += count_text("\n");
+    } else incoming += count_text("<unit>");
+    incoming += (int)packet->audio_embed.size() / hidden_size;
+    if (!kv_cache_slide_window(ctx_omni, params, incoming) || !duplex_inject_memory(ctx_omni, params, incoming)) return false;
 
     // 单 packet 版本：语义上等价于原 batch.size()==1 的情况。
     // duplex 下 prefill/decode 必须严格 1-1 配对，否则 decode 的 KV 上下文会被
@@ -10162,36 +10169,36 @@ static void duplex_do_prefill_one(omni_context * ctx_omni, common_params * param
             bool has_slices      = (n_chunks > 1);
 
             // duplex 格式：<unit><image>[overview]</image>(<slice>[slice]</slice>)*\n[audio]
-            eval_string(ctx_omni, params, "<unit><image>",
-                        params->n_batch, &ctx_omni->n_past, false);
-            prefill_with_emb(ctx_omni, params, packet->vision_embed[0].data(),
-                             tokens_per_chunk, params->n_batch, &ctx_omni->n_past);
-            eval_string(ctx_omni, params, "</image>",
-                        params->n_batch, &ctx_omni->n_past, false);
+            if (!eval_string(ctx_omni, params, "<unit><image>",
+                        params->n_batch, &ctx_omni->n_past, false)) return false;
+            if (!prefill_with_emb(ctx_omni, params, packet->vision_embed[0].data(),
+                             tokens_per_chunk, params->n_batch, &ctx_omni->n_past)) return false;
+            if (!eval_string(ctx_omni, params, "</image>",
+                        params->n_batch, &ctx_omni->n_past, false)) return false;
             if (has_slices) {
                 for (int i = 1; i < n_chunks; i++) {
-                    eval_string(ctx_omni, params, "<slice>",
-                                params->n_batch, &ctx_omni->n_past, false);
-                    prefill_with_emb(ctx_omni, params, packet->vision_embed[i].data(),
-                                     tokens_per_chunk, params->n_batch, &ctx_omni->n_past);
-                    eval_string(ctx_omni, params, "</slice>",
-                                params->n_batch, &ctx_omni->n_past, false);
+                    if (!eval_string(ctx_omni, params, "<slice>",
+                                params->n_batch, &ctx_omni->n_past, false)) return false;
+                    if (!prefill_with_emb(ctx_omni, params, packet->vision_embed[i].data(),
+                                     tokens_per_chunk, params->n_batch, &ctx_omni->n_past)) return false;
+                    if (!eval_string(ctx_omni, params, "</slice>",
+                                params->n_batch, &ctx_omni->n_past, false)) return false;
                 }
-                eval_string(ctx_omni, params, "\n",
-                            params->n_batch, &ctx_omni->n_past, false);
+                if (!eval_string(ctx_omni, params, "\n",
+                            params->n_batch, &ctx_omni->n_past, false)) return false;
             }
             if (has_audio) {
                 // duplex 下 audio 直接跟在 vision 后面（无 audio_start/end 标签）
-                prefill_with_emb(ctx_omni, params, packet->audio_embed.data(),
-                                 n_audio_tokens, params->n_batch, &ctx_omni->n_past);
+                if (!prefill_with_emb(ctx_omni, params, packet->audio_embed.data(),
+                                 n_audio_tokens, params->n_batch, &ctx_omni->n_past)) return false;
             }
         } else {
             // 纯音频 unit
-            eval_string(ctx_omni, params, "<unit>",
-                        params->n_batch, &ctx_omni->n_past, false);
+            if (!eval_string(ctx_omni, params, "<unit>",
+                        params->n_batch, &ctx_omni->n_past, false)) return false;
             if (has_audio) {
-                prefill_with_emb(ctx_omni, params, packet->audio_embed.data(),
-                                 n_audio_tokens, params->n_batch, &ctx_omni->n_past);
+                if (!prefill_with_emb(ctx_omni, params, packet->audio_embed.data(),
+                                 n_audio_tokens, params->n_batch, &ctx_omni->n_past)) return false;
             }
         }
 
@@ -10211,6 +10218,7 @@ static void duplex_do_prefill_one(omni_context * ctx_omni, common_params * param
         "[prof] llm prefill n_past=%d->%d tokens=%d ms=%.1f\n",
         n_past_0, ctx_omni->n_past,
         ctx_omni->n_past - n_past_0, ms);
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -10234,6 +10242,8 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
 
     ctx_omni->stream_decode_start_time = std::chrono::high_resolution_clock::now();
     auto t_dec_begin = ctx_omni->stream_decode_start_time;
+    if (kv_trace_enabled()) LOG_INF("KV_PHASE input=%d phase=decode ctx=%p past=%d\n",
+        ctx_omni->trace_input.load(), (void *)ctx_omni->ctx_llama, ctx_omni->n_past);
     int  n_past_dec_0 = ctx_omni->n_past;
 
     print_with_timestamp("Duplex decode: start, n_past=%d, n_keep=%d, n_ctx=%d\n",
@@ -10300,6 +10310,7 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
             ctx_omni->text_streaming = false;
             ctx_omni->text_cv.notify_all();
         }
+        kv_publish_stats(ctx_omni);
         return true;
     }
 
@@ -10340,6 +10351,7 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
                 ctx_omni, params, ctx_omni->ctx_sampler,
                 ctx_omni->n_past, hidden_states, sampled_token, &boundary_tokens);
             std::unique_ptr<float, decltype(&std::free)> owned_hidden(hidden_states, &std::free);
+            if (ctx_omni->kv_input_failed) return false;
 
             total_tokens_generated++;
 
@@ -10522,6 +10534,7 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
         ctx_omni->current_turn_id++;
     }
 
+    kv_publish_stats(ctx_omni);
     auto t_dec_end = std::chrono::high_resolution_clock::now();
     double dec_ms = std::chrono::duration<double, std::milli>(t_dec_end - t_dec_begin).count();
     print_with_timestamp(
@@ -10621,9 +10634,14 @@ static void duplex_llm_thread_func(omni_context * ctx_omni, common_params * para
             dup->llm_cv.notify_all();  // encoder 在等 prefill_queue 腾位
 
             if (packet) {
+                const auto now = std::chrono::steady_clock::now();
+                ctx_omni->llm_queue_ms.store(std::chrono::duration<double, std::milli>(now - packet->encoded).count());
+                ctx_omni->input_age_ms.store(std::chrono::duration<double, std::milli>(now - packet->submitted).count());
                 // Stage 3: 先试 fused（1 次 llama_decode），失败回退到老 5-7 段路径。
-                if (!duplex_do_prefill_one_fused(ctx_omni, params, packet, hidden_size)) {
-                    duplex_do_prefill_one(ctx_omni, params, packet, hidden_size);
+                ctx_omni->kv_input_failed = false;
+                if (!duplex_do_prefill_one_fused(ctx_omni, params, packet, hidden_size) &&
+                    !ctx_omni->kv_input_failed) {
+                    if (!duplex_do_prefill_one(ctx_omni, params, packet, hidden_size)) ctx_omni->kv_input_failed = true;
                 }
                 delete packet;
                 dup->in_flight_prefill.fetch_sub(1);
@@ -10632,12 +10650,18 @@ static void duplex_llm_thread_func(omni_context * ctx_omni, common_params * para
         }
 
         // ---- Phase 2: decode ----
-        if (!ctx_omni->break_event.load()) {
+        if (!ctx_omni->break_event.load() && !ctx_omni->kv_input_failed) {
             bool ok = duplex_do_decode(ctx_omni, params,
                                        decode_req->debug_dir, decode_req->round_idx);
             decode_req->ok.store(ok);
         } else {
             decode_req->ok.store(false);
+        }
+        if (!decode_req->ok.load()) {
+            std::lock_guard<std::mutex> lock(ctx_omni->text_mtx);
+            ctx_omni->text_done_flag = true;
+            ctx_omni->text_streaming = false;
+            ctx_omni->text_cv.notify_all();
         }
         decode_req->done.store(true);
         dup->decode_done_cv.notify_all();
@@ -10925,6 +10949,12 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
         
         // 🔧 [#39 滑动窗口] 注册 system prompt 保护长度
         sliding_window_register_system_prompt(ctx_omni);
+        const char * window = std::getenv("OMNI_DUPLEX_WINDOW");
+        if (ctx_omni->duplex_mode && window && std::strcmp(window, "turn") == 0) {
+            ctx_omni->sliding_window_config.mode = "turn";
+            ctx_omni->n_keep = ctx_omni->system_preserve_length;
+        }
+        kv_publish_stats(ctx_omni);
 
         print_with_timestamp("n_past = %d\n", ctx_omni->n_past);
         

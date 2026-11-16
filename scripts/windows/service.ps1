@@ -37,6 +37,8 @@ function Test-Identity($Process, $Identity) {
 
 function Get-OwnedProcesses($Snapshot) {
     $owned = @{}
+    $byId = @{}
+    foreach ($process in $Snapshot) { $byId[[int]$process.ProcessId] = $process }
     $venv = Normalize-Path $pythonPath
     foreach ($process in $Snapshot) {
         $command = ([string]$process.CommandLine).Replace('\', '/')
@@ -70,7 +72,10 @@ function Get-OwnedProcesses($Snapshot) {
         foreach ($process in $Snapshot) {
             $processId = [int]$process.ProcessId
             if ($processId -ne $PID -and -not $owned.ContainsKey($processId) -and
-                $owned.ContainsKey([int]$process.ParentProcessId)) {
+                $owned.ContainsKey([int]$process.ParentProcessId) -and
+                $byId[[int]$process.ParentProcessId].CreationDate -le $process.CreationDate) {
+                # Parent IDs survive parent exit and may be reused by Windows.
+                # An older process cannot be a child of this owned incarnation.
                 $owned[$processId] = $owned[[int]$process.ParentProcessId]
                 $added = $true
             }

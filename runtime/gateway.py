@@ -767,6 +767,16 @@ async def duplex_ws(ws: WebSocket, session_id: str):
         await ws.close(code=1013, reason="Queue full")
         return
 
+    def cancel_wait():
+        worker_pool.cancel(ticket.ticket_id)
+        # Dispatch can win the race with a queued client's disconnect. Its
+        # ticket has already left the queue, but the reserved Worker still
+        # belongs to this request and has not been connected to yet.
+        if future.done() and not future.cancelled():
+            assigned = future.result()
+            if assigned is not None:
+                worker_pool.release_worker(assigned)
+
     # 等待 Worker 分配（排队期间检测前端断连，断连时取消 ticket）
     worker: Optional[WorkerConnection] = None
     if future.done():
@@ -796,11 +806,13 @@ async def duplex_ws(ws: WebSocket, session_id: str):
                             "queue_length": worker_pool.queue_length,
                         })
                 except asyncio.CancelledError:
-                    worker_pool.cancel(ticket.ticket_id)
-                    return
+                    raise
+        except asyncio.CancelledError:
+            cancel_wait()
+            raise
         except (WebSocketDisconnect, Exception) as e:
             logger.info(f"Duplex WS disconnected during queue wait: session={session_id}, cancelling ticket {ticket.ticket_id} ({e})")
-            worker_pool.cancel(ticket.ticket_id)
+            cancel_wait()
             return
         if worker is None and future.done():
             worker = future.result()
@@ -810,16 +822,16 @@ async def duplex_ws(ws: WebSocket, session_id: str):
         await ws.close(code=1013, reason="No worker available")
         return
 
-    # 通知前端排队完成
-    await ws.send_json({"type": "queue_done"})
-    logger.info(f"Duplex WS connected: session={session_id} → {worker.worker_id}")
-
     worker.mark_busy(GatewayWorkerStatus.DUPLEX_ACTIVE, duplex_type, session_id=session_id)
     task_start = datetime.now()
 
     worker_ws = None
 
     try:
+        # Protect the first post-allocation write as well: the client may have
+        # closed while the queue was assigning this Worker.
+        await ws.send_json({"type": "queue_done"})
+        logger.info(f"Duplex WS connected: session={session_id} → {worker.worker_id}")
         import websockets
         ws_url = f"ws://{worker.host}:{worker.port}/ws/duplex?session_id={session_id}"
 
@@ -882,6 +894,8 @@ async def duplex_ws(ws: WebSocket, session_id: str):
         for task in pending:
             task.cancel()
 
+    except WebSocketDisconnect:
+        pass
     except Exception as e:
         logger.error(f"Duplex WS error: {e}", exc_info=True)
     finally:

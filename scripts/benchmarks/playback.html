@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><title>Duplex WebAudio 测量</title>
+<style>body{font:16px system-ui;max-width:900px;margin:36px auto;background:#111827;color:#e5e7eb}button{padding:12px 20px;margin-right:12px}pre{white-space:pre-wrap;background:#1f2937;padding:18px;border-radius:8px}</style>
+<h1>Duplex WebAudio 测量</h1>
+<p>使用正式 AudioPlayer 和真实 AudioContext。观测混音后的渲染回调；不录制麦克风，不判断主观音质或扬声器声学延迟。</p>
+<button id="start">开始播放观测</button><button id="stop" disabled>停止观测</button>
+<pre id="status">尚未开始</pre>
+<script type="module">
+import { AudioPlayer } from '/player/audio-player.js';
+const status = document.querySelector('#status');
+const start = document.querySelector('#start'), stop = document.querySelector('#stop');
+let player, ws, worklet, lastEpoch = 0, stats, inputTimes = new Map(), runStart, mutedUntilAck = false;
+function send(type, detail = {}) {
+    const row = { type, browser_ms: performance.now(), ...detail };
+    if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(row));
+}
+function show() { status.textContent = JSON.stringify(stats, null, 2); }
+start.onclick = async () => {
+    start.disabled = true; lastEpoch=0; mutedUntilAck=false; inputTimes.clear();
+    stats = {state:'starting', inputs:0, packets:0, renderedBlocks:0, nonzeroBlocks:0,
+        scheduleGaps:0, interruptions:0, renderHeartbeatMaxMs:0, visibility:document.visibilityState};
+    try {
+        player = new AudioPlayer({outputSampleRate:24000}); player.init();
+        await player.ctx.resume();
+        // Render probe passes samples through unchanged. The 1-second heartbeat
+        // reports the audio clock even when PCM is silent. It does not infer an
+        // underflow from waveform silence, which may be intentional speech silence.
+        const code = `class Probe extends AudioWorkletProcessor {
+            constructor(){super();this.blocks=0;this.nonzero=0;this.peak=0;this.last=0;this.cut=null;
+                this.port.onmessage=({data})=>{
+                    if(this.cut)this.port.postMessage({kind:'interrupt_window',...this.cut,end:currentTime});
+                    this.cut=data.type==='interrupt'?{index:data.index,start:currentTime,blocks:0,nonzero:0,lastNonzero:null}:null;
+                };}
+            process(inputs,outputs){const src=inputs[0]?.[0],dst=outputs[0][0];
+                if(src)dst.set(src);else dst.fill(0);let peak=0;
+                for(let i=0;i<dst.length;i++)peak=Math.max(peak,Math.abs(dst[i]));
+                if(this.cut){this.cut.blocks++;if(peak>1e-7){this.cut.nonzero++;this.cut.lastNonzero=currentTime;}}
+                this.blocks++;if(peak>1e-7)this.nonzero++;this.peak=Math.max(this.peak,peak);
+                if(currentTime-this.last>=1){this.port.postMessage({audio_time:currentTime,
+                    blocks:this.blocks,nonzero:this.nonzero,peak:this.peak});this.last=currentTime;}
+                return true;}} registerProcessor('render-probe',Probe);`;
+        const blob = URL.createObjectURL(new Blob([code],{type:'text/javascript'}));
+        await player.ctx.audioWorklet.addModule(blob); URL.revokeObjectURL(blob);
+        worklet = new AudioWorkletNode(player.ctx, 'render-probe'); worklet.connect(player.ctx.destination);
+        // This is a local diagnostic sink, retaining the production scheduling.
+        player.outputNode = worklet;
+        const run = new URL(location.href).searchParams.get('run') || 'default';
+        ws = new WebSocket(`ws://${location.host}/stream?role=observer&run=${encodeURIComponent(run)}`);
+        await new Promise((resolve,reject)=>{ws.onopen=resolve;ws.onerror=reject;});
+        runStart=performance.now(); let lastHeartbeat=runStart;
+        worklet.port.onmessage = ({data}) => {
+            if(data.kind==='interrupt_window'){send('interrupt_render_window',data);return;}
+            const now=performance.now();stats.renderHeartbeatMaxMs=Math.max(stats.renderHeartbeatMaxMs,now-lastHeartbeat);
+            lastHeartbeat=now;stats.renderedBlocks=data.blocks;stats.nonzeroBlocks=data.nonzero;
+            send('render',data);show();
+        };
+        player.onGap = gap => {stats.scheduleGaps++;send('gap',gap);};
+        player.onSchedule = detail => {send('schedule',detail);};
+        player.onMetrics = metrics => {stats.lastPlayerMetrics=metrics;send('player_metrics',metrics);};
+        ws.onmessage = ({data}) => {
+            const row=JSON.parse(data), now=performance.now();
+            if(row.type==='input'){
+                stats.inputs++;inputTimes.set(row.native_input,now);
+                if(row.forced){const draining=player.nextTime>player.ctx.currentTime;player.stopAll();mutedUntilAck=true;
+                    worklet.port.postMessage({type:'interrupt',index:row.index});
+                    stats.interruptions++;send('interrupt',{index:row.index,audio_time:player.ctx.currentTime,was_draining:draining});}
+                send('input',{index:row.index,native_input:row.native_input,native_sent_ms:row.sent_ms});
+            } else if(row.type==='input_done'){
+                if(row.forced){lastEpoch=Math.max(lastEpoch,row.epoch);mutedUntilAck=false;}
+                send('input_done',{index:row.index,forced:row.forced,epoch:row.epoch});
+            } else if(row.type==='audio'){
+                const event=row.event,epoch=event.audio_epoch??0;
+                if(mutedUntilAck){send('muted_packet',{epoch});return;}
+                if(epoch<lastEpoch){send('stale_packet',{epoch});return;}
+                if(epoch>lastEpoch){player.stopAll();lastEpoch=epoch;}
+                if(event.audio){
+                    worklet.port.postMessage({type:'resume'});
+                    stats.packets++; if(!player.turnActive)player.beginTurn();
+                    const input=event.trace?.input;
+                    send('pcm_arrival',{input,turn:event.trace?.turn,epoch,
+                        input_to_pcm_ms:inputTimes.has(input)?now-inputTimes.get(input):null,
+                        context_state:player.ctx.state,audio_time:player.ctx.currentTime});
+                    player.playChunk(event.audio,now);
+                }
+                if(event.speech_end)player.endTurn();
+            } else if(row.type==='complete'){
+                worklet.port.postMessage({type:'resume'});
+                stats.state=row.success===false?'aborted':'completed';send('complete',{...stats,duration_ms:now-runStart});show();
+            }
+            show();
+        };
+        player.ctx.onstatechange=()=>send('context_state',{state:player.ctx.state});
+        send('start',{userAgent:navigator.userAgent,sample_rate:player.ctx.sampleRate,
+            base_latency:player.ctx.baseLatency,output_latency:player.ctx.outputLatency??null,
+            visibility:document.visibilityState,scope:'native stream + loopback observer + production player + render worklet'});
+        stats.state='observing';stop.disabled=false;show();
+    } catch(error){player?.stop();worklet?.disconnect();if(player?.ctx)await player.ctx.close();ws?.close();stats.state='error';stats.error=String(error);show();start.disabled=false;}
+};
+stop.onclick=async()=>{send('stop',stats);player.stop();worklet?.disconnect();await player.ctx.close();ws?.close();stats.state='stopped';stop.disabled=true;start.disabled=false;show();};
+document.addEventListener('visibilitychange',()=>send('visibility',{state:document.visibilityState}));
+</script></html>

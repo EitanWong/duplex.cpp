@@ -1407,11 +1407,32 @@ struct ggml_backend_cuda_context {
     ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
         const int64_t time_now = ggml_time_us();
 
-        // sweep every 5s, evicting cuda graphs unused for >=10s
+        // Preserve the 10s policy by default. A bounded opt-in experiment can
+        // keep speech graphs through natural pauses; this retains graph metadata
+        // and executables, never KV contents. Expiry stays finite; graph count
+        // still depends on the workload and must be measured.
+        static const int64_t max_idle_us = [] {
+            const char * value = std::getenv("GGML_CUDA_GRAPH_IDLE_MS");
+            if (!value) return int64_t(10'000'000);
+            char * end = nullptr;
+            const long ms = std::strtol(value, &end, 10);
+            if (!*value || *end || ms < 1 || ms > 120'000) {
+                GGML_LOG_WARN("GGML_CUDA_GRAPH_IDLE_MS must be 1..120000; using 10000\n");
+                return int64_t(10'000'000);
+            }
+            return int64_t(ms) * 1000;
+        }();
+        // Sweep every 5s; age is still checked independently per graph.
         if (time_now - last_graph_eviction_sweep >= 5'000'000) {
             last_graph_eviction_sweep = time_now;
             for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
-                if (time_now - it->second->last_used_time >= 10'000'000) {
+                if (time_now - it->second->last_used_time >= max_idle_us) {
+                    const char * trace = std::getenv("OMNI_KV_TRACE");
+                    if (trace && std::string(trace) == "1") {
+                        GGML_LOG_INFO("KV_GRAPH_EVICT key=%p nodes=%zu idle_ms=%.3f limit_ms=%.3f\n",
+                            it->first, it->second->node_props.size(),
+                            (time_now - it->second->last_used_time) / 1000.0, max_idle_us / 1000.0);
+                    }
                     it = cuda_graphs.erase(it);
                 } else {
                     ++it;

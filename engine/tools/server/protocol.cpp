@@ -11,6 +11,7 @@
 json ProtocolMetrics::to_json() const {
     json m;
     m["backend"] = backend;
+    if (!kv.is_null()) m["kv"] = kv;
     if (kv_cache_length > 0) {
         m["kv_cache_length"] = kv_cache_length;
     }

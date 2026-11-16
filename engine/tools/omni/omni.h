@@ -210,6 +210,22 @@ struct omni_context {
     struct omni_output *omni_output = NULL;
     int n_past = 0;
     int n_keep = 0;
+
+    // Published by the sole LLM thread; consumers must not inspect live cell
+    // metadata from the WebSocket/TTS threads.
+    std::atomic<int> kv_used{0}, kv_physical_span{0}, kv_attention_span{0}, kv_capacity{0};
+    std::atomic<uint64_t> kv_allocated_bytes{0};
+    std::atomic<int> kv_evictions{0}, kv_evicted_tokens{0}, kv_unit_fallbacks{0};
+    std::atomic<double> kv_prune_ms{0.0};
+    std::atomic<double> input_queue_ms{0.0}, llm_queue_ms{0.0}, input_age_ms{0.0};
+    std::atomic<int> kv_accounted_tokens{0};
+    std::atomic<int> kv_completed_turn{0};
+    bool kv_input_failed = false;
+    std::mutex memory_mutex;
+    std::string memory_pending_text, memory_last_text;
+    int memory_last_unit_id = -1;
+    std::atomic<int> memory_injections{0}, memory_tokens{0};
+    std::atomic<double> memory_prefill_ms{0.0}, memory_retrieval_ms{0.0};
     
     // ==================== 轮次边界管理（用于智能滑动窗口） ====================
     // 每轮对话开始时的 n_past 位置

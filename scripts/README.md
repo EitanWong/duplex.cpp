@@ -32,6 +32,20 @@ Start waits for the model and Gateway worker registration. Repeated starts reuse
 services; stop interrupts active sessions and releases the native engine's VRAM.
 The HTTP/HTTPS config is retained. See the [Windows guide](../docs/nvidia.md).
 
+`windows/realtime.ps1 -Action start|stop|status|run` controls the independent
+authenticated ModelBest audio/video and OpenAI audio adapters on port 8006.
+Start the Gateway and Worker first. See [ModelBest Realtime](../docs/modelbest-realtime.md)
+and [OpenAI Realtime](../docs/realtime.md) for protocol selection and deployment.
+
+`windows/export-qwen-client.ps1` exports a private LAN client configuration bundle
+with the API key, CA public certificate and a connection checker to `.local/`.
+Configure the other computer's qwen app with that model endpoint.
+
+`windows/qwen-audio-agent.ps1 -Action start|stop|status|run` is an optional
+official WebUI integration tool; external qwen apps only need the model API.
+For this tool, install the official npm package locally or pass `-QwenRoot`. See the
+[integration guide](../docs/qwen-audio-agent.md).
+
 ## macOS
 
 ```bash
@@ -56,6 +70,14 @@ python scripts/benchmarks/pipeline.py --help
 python scripts/benchmarks/session-reuse.py --help
 python scripts/benchmarks/kv-cache.py --help
 python scripts/benchmarks/compare.py --help
+python scripts/benchmarks/summarize-session.py --help
+python scripts/benchmarks/analyze-steady.py --help
+python scripts/benchmarks/playback-server.py --help
+python scripts/benchmarks/analyze-playback.py --help
+python scripts/benchmarks/realtime.py --help
+python scripts/benchmarks/modelbest-realtime.py --help
+node scripts/benchmarks/qwen-audio-agent.mjs
+node scripts/benchmarks/qwen-audio-agent.mjs --desktop-settings
 python scripts/check-repository.py
 ```
 
@@ -65,6 +87,14 @@ and speech history. See [optimization evidence](../docs/inference-optimization.m
 for measured results, experimental switches and commands.
 For KV formats, pruning limits and the physical-span diagnostic, see
 [KV cache research](../docs/kv-cache-rtx3060.md).
+`pipeline.py --resources` samples per-process Windows RAM/WDDM usage;
+`--memory-file` replays explicitly supplied user quotations. `long-history.cpp`
+checks real prompt depths and bilingual facts. Commands, memory schema, opt-in
+switches and negative 16K results are in the [long-session report](../docs/long-session-rtx3060.md).
+
+The [steady/playback report](../docs/steady-playback-rtx3060.md) documents real-hour
+replay, periodic interruptions, intact-input burst stress and browser render probes.
+The observer uses a localhost relay and the production AudioPlayer, without a microphone.
 
 There is currently no supported Linux production launcher. Linux CI validates
 source and schemas; it does not establish Linux inference support.

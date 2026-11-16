@@ -102,7 +102,7 @@ if (-not $ConfigureOnly) {
             }
         }
     }
-    & $cmake --build $buildDir --target llama-omni-server llama-bench token2wav-example test-backend-ops test-tts-cpu-head test-tts-cuda-head test-vision-encode test-audio-encode test-tts-condition --parallel $Jobs
+    & $cmake --build $buildDir --target llama-omni-server llama-bench token2wav-example test-backend-ops test-kv-budget test-kv-ledger test-tts-cpu-head test-tts-cuda-head test-vision-encode test-audio-encode test-tts-condition --parallel $Jobs
     if ($LASTEXITCODE -ne 0) { throw 'CUDA build failed.' }
     [IO.File]::WriteAllText($dependencyRepairStamp, 'MSVC include dependency repair completed.')
 }
